@@ -126,6 +126,15 @@ const PACKAGE_MEMES_DIR = join(PACKAGE_ROOT_ASSETS, 'memes');
 /** 路由前缀 */
 const ROUTE_PREFIX = '/dsh-pet-7340';
 
+/**
+ * 宿主是不是 **DSH 桌面应用**（Electron 宿主）。
+ *
+ * 判据只用 `process.versions.electron`：桌面应用以 `ELECTRON_RUN_AS_NODE=1` 跑宿主（见 dsh.cmd），
+ * 该字段照样在；而 `dsh web` / 独立模式都是纯 Node 进程，取不到它。据此把「打开网站」自动分派：
+ * 桌面宿主 → 唤起桌面应用窗口（helper 走 `dsh://open`），其余 → 浏览器打开站点。
+ */
+const isDesktopHost = (): boolean => Boolean(process.versions.electron);
+
 /** 不同扩展名对应的 Content-Type 映射 */
 const MIME: Record<string, string> = {
   '.webm': 'video/webm',
@@ -654,6 +663,10 @@ export function apply(ctx: any): void {
           DSH_PET_CONFIG_URL: configUrl,
           // 已鉴权站点 URL（含本进程启动令牌）：只供 helper 的「打开网站」使用，任何日志都不许出现它
           DSH_PET_SITE_URL: siteUrl,
+          // 宿主形态决定工具项「打开网站」的去向（同名菜单项，两端两种语义）：
+          //   desktop = 宿主是 DSH 桌面应用 → 唤起桌面应用主窗口（helper 走 dsh://open，见 main.js）
+          //   site    = dsh web / 独立模式 → 系统默认浏览器打开站点（原行为，别破坏）
+          DSH_PET_OPEN_TARGET: isDesktopHost() ? 'desktop' : 'site',
           DSH_PET_SCALE: '1',
           // 打开 bridge 协议：main.js 注册 dsh-pet-bridge scheme，把渲染端请求经管道转给宿主
           DSH_PET_BRIDGE: '1',

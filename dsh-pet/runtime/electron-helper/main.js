@@ -253,6 +253,11 @@ function petScale() {
 
 /** bridge 模式：DSH_PET_BRIDGE=1（宿主注入）。开启时注册 dsh-pet-bridge scheme + 管道转发 */
 const BRIDGE = process.env.DSH_PET_BRIDGE === '1';
+
+/** 「打开网站」这一项的去向（宿主按自身形态注入）：
+ *  'desktop' = 宿主是 DSH 桌面应用 → 唤起桌面应用主窗口；
+ *  'site'    = dsh web / 独立模式 / 手写 start-desktop（无该变量）→ 原行为：默认浏览器打开站点。 */
+const OPEN_TARGET = process.env.DSH_PET_OPEN_TARGET === 'desktop' ? 'desktop' : 'site';
 /** 协议行前缀（与 helper-process.ts 的 BRIDGE_PREFIX 一致） */
 const BRIDGE_PREFIX = 'dsh-pet-bridge:';
 
@@ -530,6 +535,8 @@ function createPetWindows() {
         query: {
           configUrl,
           bridge: BRIDGE ? '1' : '0',
+          // 工具项「打开网站」的文案按宿主形态自动变（见 sprite.js）：desktop=唤起桌面应用 / site=打开站点
+          openTarget: OPEN_TARGET,
           scale: String(scale),
           petIndex: String(pet.index),
           workAreaW: String(area.width),
@@ -776,9 +783,7 @@ app.whenReady().then(() => {
   // 右键菜单「打开网站」：交给**系统默认浏览器**打开（等效于网页里 Ctrl+点击链接新标签页），
   // 不建专属窗口——宠物窗口机制是透明小窗，不该承载常规网页浏览。URL 由渲染端从
   // configUrl 推导 = DSH webServer 端口，端口变化自动跟随
-  ipcMain.on('pet:open-site', (event, payload) => {
-    const url = payload && typeof payload === 'object' ? String(payload.url || '') : '';
-    if (!/^https?:[/][/]/.test(url)) return;
+  const openSite = (url) => {
     // 宿主注入的已鉴权站点 URL（含本进程启动令牌）：DSH 只在 `GET /` 接受它并换发绑定 authority 的
     // 浏览器 Cookie，裸 origin 在默认浏览器里必然 401（#87）。令牌等价登录态，所以**只在与目标同
     // origin 时**才启用——绝不让它被带去别的站点；取不到该变量（旧宿主 / standalone / 手写
@@ -795,6 +800,26 @@ app.whenReady().then(() => {
     shell.openExternal(target).catch((error) => {
       console.error('[dsh-pet-desktop-helper] openExternal failed:', error);
     });
+  };
+
+  // 去向由宿主形态决定（OPEN_TARGET，宿主按自身形态注入）：
+  //   desktop（宿主 = DSH 桌面应用）→ 用应用自注册的 dsh:// 协议把主窗口叫回前台：已运行则第二个实例
+  //     被单实例锁拦下、宿主收到 second-instance 后 focusPrimaryWindow()；未运行则协议直接把应用拉起来。
+  //     比 spawn 宿主 exe 干净——不必处理 ELECTRON_RUN_AS_NODE（spawn 继承它就成了 node 模式，起不了界面）
+  //     与安装路径探测。
+  //   site（dsh web / 独立模式）→ 原行为：系统默认浏览器打开站点。
+  ipcMain.on('pet:open-site', (event, payload) => {
+    const url = payload && typeof payload === 'object' ? String(payload.url || '') : '';
+    if (!/^https?:[/][/]/.test(url)) return;
+    if (OPEN_TARGET === 'desktop') {
+      // 协议未注册（绿色版 / 注册表被清）时回落成打开站点，至少不是"点了没反应"
+      shell.openExternal('dsh://open').catch((error) => {
+        console.error('[dsh-pet-desktop-helper] open dsh:// failed, falling back to site:', error);
+        openSite(url);
+      });
+      return;
+    }
+    openSite(url);
   });
 
   // 显示器热更新：分辨率/缩放变化、插拔屏、旋转都会让桌面几何失效。原先几何只在
