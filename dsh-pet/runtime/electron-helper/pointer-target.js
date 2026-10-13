@@ -19,6 +19,7 @@ const HIT_BOX = { x0: 200, y0: 50, x1: 440, y1: 335 };
 /** 动画画布尺寸：高取 shared 的 CANVAS_H，宽与 sprite.js / shared 一样用字面量 640（shared 未导出宽） */
 const CANVAS_H = 360;
 const STAGE_W = 640;
+const FEET_Y = 330;
 
 /**
  * 窗口矩形 → 宠物身体命中区的屏幕矩形（DIP）。
@@ -31,11 +32,12 @@ function spriteHitRect(bounds) {
   const margin = Math.round(bounds.width / 4);
   const stageW = bounds.width - margin * 2;
   const stageH = (stageW * CANVAS_H) / STAGE_W;
+  const bottomPad = (stageH * (CANVAS_H - FEET_Y)) / CANVAS_H;
   return {
     left: bounds.x + margin + (HIT_BOX.x0 / STAGE_W) * stageW,
-    top: bounds.y + margin + (HIT_BOX.y0 / CANVAS_H) * stageH,
+    top: bounds.y + margin + bottomPad + (HIT_BOX.y0 / CANVAS_H) * stageH,
     right: bounds.x + margin + (HIT_BOX.x1 / STAGE_W) * stageW,
-    bottom: bounds.y + margin + (HIT_BOX.y1 / CANVAS_H) * stageH,
+    bottom: bounds.y + margin + bottomPad + (HIT_BOX.y1 / CANVAS_H) * stageH,
   };
 }
 
@@ -70,7 +72,7 @@ function pointerZone(bounds, point) {
  * 该不该让窗口保持穿透（= `setIgnoreMouseEvents` 的第一个参数）。
  *
  * 规则（与 issue #55 报告者实测的表一致）：
- *  - 渲染端正拿着鼠标输入（拖拽中 / 菜单开着 / 对话弹窗开着）→ **不穿透**，最高优先级；
+ *  - 拖拽中 → **不穿透**，最高优先级；菜单/聊天框只让各自控件矩形接收点击；
  *  - 光标在宠物身体上 → 不穿透（可交互）；
  *  - 光标在窗口内、宠物外 → **保持当前状态**（渲染端自绘的右键菜单/对话弹窗要可点），
  *    但非 busy 且连续停留超过 OFF_BODY_RELEASE_MS 后强制恢复穿透；
@@ -92,10 +94,22 @@ function pointerZone(bounds, point) {
  *   渲染端那条通道也在翻转它，本地副本会与之失步）
  * @param {boolean} busy 渲染端是否正在用这个窗口的鼠标输入（拖拽中/菜单开/弹窗开，见 inputBusy）
  * @param {number} [offBodyMs=0] 光标在窗口余量区（非 busy）的连续停留时长，超时即恢复穿透
+ * @param {{dragging:boolean, rects:Array<{x:number,y:number,width:number,height:number}>}} [input]
+ *   新渲染端上报的窗口局部交互矩形。菜单/聊天框只占自己的区域；拖拽仍拥有完整输入租约。
  * @returns {boolean} 新的穿透状态
  */
-function decideWindowIgnore(bounds, point, ignoring, busy, offBodyMs = 0) {
-  if (busy) return false; // 输入租约期内保持可交互
+function decideWindowIgnore(bounds, point, ignoring, busy, offBodyMs = 0, input) {
+  if (busy) {
+    if (!input || input.dragging) return false; // 兼容旧渲染端；拖拽租约绝不被位置判定打断
+    const inControl = input.rects.some(
+      (r) =>
+        point.x >= bounds.x + r.x &&
+        point.x < bounds.x + r.x + r.width &&
+        point.y >= bounds.y + r.y &&
+        point.y < bounds.y + r.y + r.height,
+    );
+    return !inControl && pointerZone(bounds, point) !== 'body';
+  }
   const zone = pointerZone(bounds, point);
   if (zone === 'outside') return true; // 窗外：恢复穿透
   if (zone === 'body') return false; // 宠物身上：可交互
@@ -107,6 +121,7 @@ module.exports = {
   HIT_BOX,
   CANVAS_H,
   STAGE_W,
+  FEET_Y,
   POINTER_POLL_MS,
   OFF_BODY_RELEASE_MS,
   spriteHitRect,

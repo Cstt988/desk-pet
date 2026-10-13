@@ -25,6 +25,7 @@ const {
   HIT_BOX,
   CANVAS_H,
   STAGE_W,
+  FEET_Y,
   POINTER_POLL_MS,
   OFF_BODY_RELEASE_MS,
   spriteHitRect,
@@ -172,11 +173,12 @@ describe('spriteHitRect —— 与渲染端命中判定同源（否则两条通�
     // 窗口 = 画布 + 两侧各 margin(231)；画布 462×260，身体命中区取画布 640×360 的 200..440 / 50..335
     const margin = 231;
     const stageH = (462 * CANVAS_H) / STAGE_W;
+    const bottomPad = (stageH * (CANVAS_H - FEET_Y)) / CANVAS_H;
     const near = (actual: number, expected: number) => Math.abs(actual - expected) < 0.01;
     assert.ok(near(r.left, bounds.x + margin + (200 / STAGE_W) * 462), 'left=' + r.left);
     assert.ok(near(r.right, bounds.x + margin + (440 / STAGE_W) * 462), 'right=' + r.right);
-    assert.ok(near(r.top, bounds.y + margin + (50 / CANVAS_H) * stageH), 'top=' + r.top);
-    assert.ok(near(r.bottom, bounds.y + margin + (335 / CANVAS_H) * stageH), 'bottom=' + r.bottom);
+    assert.ok(near(r.top, bounds.y + margin + bottomPad + (50 / CANVAS_H) * stageH), 'top=' + r.top);
+    assert.ok(near(r.bottom, bounds.y + margin + bottomPad + (335 / CANVAS_H) * stageH), 'bottom=' + r.bottom);
     // 命中区必须完全落在窗口内（否则永远不会触发 + 会误判窗外）
     assert.ok(r.left > bounds.x && r.right < bounds.x + bounds.width);
     assert.ok(r.top > bounds.y && r.bottom < bounds.y + bounds.height);
@@ -192,17 +194,39 @@ describe('spriteHitRect —— 与渲染端命中判定同源（否则两条通�
   });
 });
 
+describe('菜单/聊天框只占控件矩形，不吞掉其它应用点击', () => {
+  const input = { dragging: false, rects: [{ x: 10, y: 10, width: 150, height: 200 }] };
+  test('控件内保持交互，透明余量立即穿透，即使 busy=true', () => {
+    assert.equal(decideWindowIgnore(bounds, { x: 1020, y: 520 }, true, true, 0, input), false);
+    assert.equal(decideWindowIgnore(bounds, { x: 1200, y: 520 }, false, true, 0, input), true);
+    assert.equal(decideWindowIgnore(bounds, { x: 0, y: 0 }, false, true, 0, input), true);
+  });
+  test('菜单开着也能点击身体；拖拽跨出窗口仍保留输入', () => {
+    const r = spriteHitRect(bounds);
+    assert.equal(decideWindowIgnore(bounds, { x: r.left + 1, y: r.top + 1 }, true, true, 0, input), false);
+    assert.equal(
+      decideWindowIgnore(bounds, { x: -9999, y: -9999 }, true, true, 0, { ...input, dragging: true }),
+      false,
+    );
+  });
+  test('多级菜单的每个面板都可交互，面板间的透明间隙保持穿透', () => {
+    const cascade = { dragging: false, rects: [...input.rects, { x: 180, y: 10, width: 150, height: 300 }] };
+    assert.equal(decideWindowIgnore(bounds, { x: 1190, y: 520 }, true, true, 0, cascade), false);
+    assert.equal(decideWindowIgnore(bounds, { x: 1170, y: 520 }, false, true, 0, cascade), true);
+  });
+});
+
 describe('源码守卫 —— helper 的两个兜底必须在位', () => {
   const main = readSource(helper + 'main.js');
 
   test('#55-1 兜底显示：ready-to-show 之外还要有"加载完成后仍未显示就 show"', () => {
-    assert.ok(/once\('ready-to-show', \(\) => win\.show\(\)\)/.test(main), 'ready-to-show 的正常路径不能删');
+    assert.ok(/once\('ready-to-show', \(\) => win\.showInactive\(\)\)/.test(main), '显示不得抢其它应用焦点');
     assert.ok(
       /once\('did-finish-load'/.test(main),
       '必须有 did-finish-load 兜底（paintWhenInitiallyHidden:false 时 ready-to-show 永不触发）',
     );
     assert.ok(
-      /!win\.isDestroyed\(\) && !win\.isVisible\(\)\) win\.show\(\)/.test(main),
+      /!win\.isDestroyed\(\) && !win\.isVisible\(\)\) win\.showInactive\(\)/.test(main),
       '兜底必须在"仍未显示"时才 show',
     );
   });
@@ -251,6 +275,7 @@ describe('守卫：主进程镜像的命中盒常量不得与 src/shared/constan
       return Number(m[1]);
     };
     assert.equal(CANVAS_H, num('CANVAS_H'));
+    assert.equal(FEET_Y, num('FEET_Y'));
     const hit = /export const HIT_BOX = \{ x0: (\d+), y0: (\d+), x1: (\d+), y1: (\d+) \}/.exec(shared);
     assert.ok(hit, 'shared 里的 HIT_BOX 形状变了，请同步 pointer-target.js');
     assert.deepEqual(HIT_BOX, { x0: Number(hit[1]), y0: Number(hit[2]), x1: Number(hit[3]), y1: Number(hit[4]) });

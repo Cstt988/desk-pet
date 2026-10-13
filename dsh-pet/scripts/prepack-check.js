@@ -78,6 +78,7 @@ const required = [
   'runtime/electron-helper/host-liveness.js', // 桌面模式宿主存活判定（main.js require，缺了会启动即崩）
   'runtime/electron-helper/topmost-watchdog.js', // 桌面模式置顶看门狗判定（main.js require，缺了会启动即崩）
   'runtime/electron-helper/dpi-linearization.js', // 桌面模式 DPI 线性化判定与换算（main.js require，缺了会启动即崩）
+  'runtime/electron-helper/desktop-geometry.js', // 活动边界与菜单工作区分离
   'runtime/electron-helper/preload.js', // 桌面模式 preload 桥
   'runtime/electron-helper/renderer.js', // 桌面模式渲染端（宠物本体）
   'runtime/electron-helper/shared-core.js', // 桌面模式共享纯逻辑（src/shared 构建产物，window.PetShared）

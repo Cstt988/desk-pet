@@ -26,9 +26,12 @@ contextBridge.exposeInMainWorld('petBridge', {
   setInteractive(interactive) {
     ipcRenderer.send('pet:set-interactive', !!interactive);
   },
-  // 我正在用这个窗口的鼠标输入（拖拽中/菜单开/弹窗开）：主进程兜底通道在 busy 期间绝不翻回穿透
+  // 忙碌态配合 setInputRegions：拖拽持续捕获，菜单/聊天框外仍可点击其它应用。
   setInputBusy(busy) {
     ipcRenderer.send('pet:input-busy', !!busy);
+  },
+  setInputRegions(input) {
+    ipcRenderer.send('pet:input-regions', input);
   },
   // 右键菜单「打开网站」：主进程按宿主形态打开——桌面应用宿主唤起桌面窗口（dsh://open），否则系统默认浏览器打开 DSH 网站（等效网页 Ctrl+点击链接）
   openDshSite(url) {

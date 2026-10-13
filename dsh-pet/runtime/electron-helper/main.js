@@ -58,6 +58,7 @@ const { TOPMOST_WATCHDOG_TICK_MS, shouldReassertTopmost } = require('./topmost-w
 const { HOST_POLL_MS, hostIsGone, isBrokenPipeError, parseHostPid } = require('./host-liveness.js');
 // 全局 DPI 线性化的纯判定与换算（含平台例外：macOS 的 DIP 已是「点」，无需补偿；见该文件头）
 const { shouldLinearize, resolveForcedScale, resolvePetScale } = require('./dpi-linearization.js');
+const { buildDeskGeometry } = require('./desktop-geometry.js');
 
 // 允许无用户手势直接播放（余额动画等）
 app.commandLine.appendSwitch('autoplay-policy', 'no-user-gesture-required');
@@ -341,6 +342,8 @@ let pointerFallbackPaused = false;
  * 而渲染端知道（拖拽中 / 菜单开着 / 对话弹窗开着）。所以只由它上报，busy 期间本进程绝不翻回穿透。
  */
 const inputBusy = new Map();
+/** 新渲染端把菜单/聊天框局部矩形单独上报，避免忙碌态下整窗透明余量吞点击。 */
+const inputRegions = new Map();
 
 /** 每窗口「光标停在余量区且非 busy」的连续时长（ms）：到点由兜底通道强制恢复穿透 */
 const offBodyMs = new Map();
@@ -385,37 +388,7 @@ function petWindowSize(size) {
  * （实测右倒 T 型双屏：hull 的 23.7% 是空洞，宠物飞进去就彻底看不见了）。
  */
 function deskGeometry() {
-  const displays = screen.getAllDisplays();
-  const areas = displays.map((d) => ({
-    x: d.workArea.x,
-    y: d.workArea.y,
-    width: d.workArea.width,
-    height: d.workArea.height,
-  }));
-  // 每块屏的**完整面板**（含任务栏区）：抛掷的「越界侧有没有邻屏」探测用它，否则任务栏
-  // 在接缝处挖出的工作区条带会被当成墙，宠物穿不过上下叠放的屏（见 shared/physics.ts）
-  const panels = displays.map((d) => ({
-    x: d.bounds.x,
-    y: d.bounds.y,
-    width: d.bounds.width,
-    height: d.bounds.height,
-  }));
-  let x0 = Infinity;
-  let y0 = Infinity;
-  let x1 = -Infinity;
-  let y1 = -Infinity;
-  for (const a of areas) {
-    x0 = Math.min(x0, a.x);
-    y0 = Math.min(y0, a.y);
-    x1 = Math.max(x1, a.x + a.width);
-    y1 = Math.max(y1, a.y + a.height);
-  }
-  const primaryId = screen.getPrimaryDisplay().id;
-  const primaryIndex = Math.max(
-    0,
-    displays.findIndex((d) => d.id === primaryId),
-  );
-  return { hull: { x: x0, y: y0, width: x1 - x0, height: y1 - y0 }, areas, panels, primaryIndex };
+  return buildDeskGeometry(screen.getAllDisplays(), screen.getPrimaryDisplay().id, process.platform);
 }
 
 function createPetWindows() {
@@ -434,6 +407,8 @@ function createPetWindows() {
       y: area.y,
       show: false,
       useContentSize: true,
+      // macOS 默认会把已显示窗口的 y 钳到菜单栏下沿；局部画布的透明余量必须允许伸出屏幕。
+      enableLargerThanScreen: true,
       transparent: true,
       frame: false,
       alwaysOnTop: true,
@@ -441,8 +416,7 @@ function createPetWindows() {
       resizable: false,
       hasShadow: false,
       // 可聚焦：对话输入框/菜单需要窗口焦点才能打字（focusable:false 会让输入框永远无法聚焦）。
-      // 别把这里当成黑屏的无关项：可聚焦 + 已聚焦本身就是 DWM 视频黑屏的四项触发条件之一（见文件头），
-      // 而 show() 出来就是聚焦状态——真正在挡的是「默认整窗穿透」+「小窗几乎不可能完整遮挡视频窗」
+      // 显示时使用 showInactive()，不打断其它应用；用户主动点对话输入框时仍然允许获得焦点。
       focusable: true,
       webPreferences: {
         preload: path.join(__dirname, 'preload.js'),
@@ -471,14 +445,14 @@ function createPetWindows() {
     // 默认整窗点击穿透（renderer 在光标进/出身体命中区时经 IPC 翻转可交互）；
     // forward:true 保证穿透期间 mousemove 仍转发进渲染端做命中判定。
     setWindowIgnore(win, true);
-    win.once('ready-to-show', () => win.show());
+    win.once('ready-to-show', () => win.showInactive());
     // [#55 兜底显示] paintWhenInitiallyHidden:false 时渲染器可能不产出首帧，ready-to-show 便永不触发
     // （Electron 文档原文：ready-to-show "will never fire if you use paintWhenInitiallyHidden: false"），
     // 而 show() 只挂在它上面 → 窗口永远隐藏（进程活着、宠物逻辑照跑，桌面上什么都没有）。
     // 页面加载完成后强制兜底一次；zoomFactor 的设置在更早注册的 did-finish-load 里，顺序不受影响。
     win.webContents.once('did-finish-load', () => {
       setTimeout(() => {
-        if (!win.isDestroyed() && !win.isVisible()) win.show();
+        if (!win.isDestroyed() && !win.isVisible()) win.showInactive();
       }, 400);
     });
     // [#55 兜底交互] 上面的翻转链路只有「Electron forward 鼠标钩子 → 渲染端命中判定」一个入口，
@@ -499,7 +473,7 @@ function createPetWindows() {
       const zone = pointerZone(b, point);
       const nextMs = !busy && zone === 'margin' ? (offBodyMs.get(win.id) ?? 0) + POINTER_POLL_MS : 0;
       offBodyMs.set(win.id, nextMs);
-      const next = decideWindowIgnore(b, point, ignoring, busy, nextMs);
+      const next = decideWindowIgnore(b, point, ignoring, busy, nextMs, inputRegions.get(win.id));
       if (next !== ignoring) setWindowIgnore(win, next);
     }, POINTER_POLL_MS);
     // [置顶看门狗] 建窗时那次 setAlwaysOnTop 之后再没人复查过：外部任何一次 z 序扰动都能让桌宠
@@ -528,6 +502,7 @@ function createPetWindows() {
       lastRequestedBounds.delete(win.id);
       windowIgnore.delete(win.id);
       inputBusy.delete(win.id);
+      inputRegions.delete(win.id);
       offBodyMs.delete(win.id);
     });
     win
@@ -546,6 +521,8 @@ function createPetWindows() {
           // 逐屏工作区（屏幕坐标）+ 主屏下标：渲染端所有边界判定走它们的并集，不走外接矩形。
           // 首帧就要用（position() 定角落），所以走 query；运行期变化再经 pet:displays 推送。
           areas: JSON.stringify(geo.areas),
+          workAreas: JSON.stringify(geo.workAreas),
+          topInsetRatio: String(geo.topInsetRatio),
           // 逐屏完整面板（含任务栏区）：抛掷越界侧探测用（任务栏条带不当墙，见 shared/physics.ts）
           panels: JSON.stringify(geo.panels),
           primaryIndex: String(geo.primaryIndex),
@@ -768,16 +745,31 @@ app.whenReady().then(() => {
   ipcMain.on('pet:set-interactive', (event, interactive) => {
     const win = BrowserWindow.fromWebContents(event.sender);
     if (!win || win.isDestroyed()) return;
-    setWindowIgnore(win, !interactive);
+    const input = inputRegions.get(win.id);
+    // 渲染端的旧 menuOpen/chatOpen 守卫会请求整窗可交互；这里按真实光标和控件矩形裁定。
+    const ignoring =
+      interactive && input && inputBusy.get(win.id)
+        ? decideWindowIgnore(win.getContentBounds(), screen.getCursorScreenPoint(), false, true, 0, input)
+        : !interactive;
+    setWindowIgnore(win, ignoring);
   });
 
-  // 渲染端正拿着鼠标输入（拖拽中 / 菜单开着 / 对话弹窗开着）：兜底轮询据此绝不翻回穿透。
+  // 拖拽持有完整输入租约；菜单/对话则由 inputRegions 把交互限制在实际控件矩形内。
   // 只存标记、不直接翻转窗口——**唯一出口**仍是 setWindowIgnore（在兜底轮询里按完整规则判定），
   // 否则会出现"两条通道抢着翻同一个窗口"的竞态。
   ipcMain.on('pet:input-busy', (event, busy) => {
     const win = BrowserWindow.fromWebContents(event.sender);
     if (!win || win.isDestroyed()) return;
     inputBusy.set(win.id, !!busy);
+  });
+
+  ipcMain.on('pet:input-regions', (event, input) => {
+    const win = BrowserWindow.fromWebContents(event.sender);
+    if (!win || win.isDestroyed() || !input || !Array.isArray(input.rects)) return;
+    const rects = input.rects.filter(
+      (r) => r && [r.x, r.y, r.width, r.height].every(Number.isFinite) && r.width > 0 && r.height > 0,
+    );
+    inputRegions.set(win.id, { dragging: input.dragging === true, rects });
   });
 
   // 右键菜单「打开网站」：交给**系统默认浏览器**打开（等效于网页里 Ctrl+点击链接新标签页），

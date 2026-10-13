@@ -169,6 +169,11 @@ class PetSprite {
     // 事件（与浏览器同一套：pointerdown/move、click、window pointerup/cancel）
     const ac = new AbortController();
     this.ac = ac;
+    // 级联菜单新增面板、聊天输入增长都可能在鼠标停住时发生，不能只等下一次 mousemove。
+    this.inputRegionResize = new ResizeObserver(() => this.syncInputRegions());
+    this.inputRegionElements = new Set();
+    this.inputRegionMutation = new MutationObserver(() => this.syncInputRegions());
+    this.inputRegionMutation.observe(document.body, { childList: true, subtree: true });
     this.hit.addEventListener('pointerdown', (e) => this.onPointerDown(e), { signal: ac.signal });
     this.hit.addEventListener('pointermove', (e) => this.onPointerMove(e), { signal: ac.signal });
     this.hit.addEventListener('click', () => this.onClick(), { signal: ac.signal });
@@ -180,6 +185,16 @@ class PetSprite {
     // 光标进/出身体命中区时翻转可交互；穿透期间 mousemove 由 main 转发进来（forward:true），
     // mouseleave 保证光标离开窗口立即恢复穿透（透明像素不挡下层应用，与浏览器一致）。
     window.addEventListener('mousemove', (e) => this.onMouseMove(e), { signal: ac.signal });
+    window.addEventListener(
+      'blur',
+      () => {
+        // 切到其它应用后旧菜单不应继续占着整个透明窗口；丢失松手时也释放拖拽。
+        this.closeMenu();
+        if (this.dragState.active) this.onPointerUp();
+        if (!this.chatOpen) this.setInteractive(false);
+      },
+      { signal: ac.signal },
+    );
     window.addEventListener(
       'mouseleave',
       () => {
@@ -227,6 +242,9 @@ class PetSprite {
 
   dispose() {
     this.ac.abort();
+    this.inputRegionMutation.disconnect();
+    this.inputRegionResize.disconnect();
+    this.inputRegionElements.clear();
     if (this.bubbleTimer !== null) window.clearTimeout(this.bubbleTimer);
     if (this.whisperTimer !== null) window.clearTimeout(this.whisperTimer);
     if (this.workTimer !== null) window.clearTimeout(this.workTimer);
@@ -292,7 +310,10 @@ class PetSprite {
         // marginX/marginY 是配置里的绝对像素：页面级缩放（§3.5）已统一放大整窗，
         // 配置值不再手工乘 CONFIG.scale——150% 屏上与「线性化 + 旧 CONFIG.scale 补偿」观感一致
         marginX: this.pet.position.marginX,
-        marginY: this.pet.position.marginY,
+        // macOS 顶部边距对齐身体命中盒，扣掉动画画布头顶留白。
+        marginY:
+          this.pet.position.marginY -
+          (this.pet.position.corner.startsWith('top-') ? this.size * CONFIG.topInsetRatio : 0),
         size: this.size,
         W,
         H,
@@ -308,6 +329,7 @@ class PetSprite {
   throwSpaceOf() {
     if (!this.space || this.space.areas !== AREAS || this.space.panels !== PANELS) {
       this.space = S.throwSpace({ areas: AREAS, panels: PANELS, size: this.size, sideAllow: this.sideAllow });
+      for (const b of this.space.bounds) b.minY -= this.size * CONFIG.topInsetRatio;
     }
     return this.space;
   }
@@ -955,7 +977,7 @@ class PetSprite {
    * 输入链就断了（拖拽会定格在最后一次采样上，松手也没人报 pointerup → 宠物按旧速度飞出去）。
    *
    * 这个信号是**渲染端专有的知识**：只有它知道"我正在用输入"，主进程无从推断（光看光标位置和窗口
-   * 位移分不清"拖拽跟手"和"漫游/抛掷"）。所以由渲染端上报，主进程的兜底通道据此闭嘴。
+   * 位移分不清"拖拽跟手"和"漫游/抛掷"）。同时上报控件矩形：菜单/聊天框外的透明区域继续穿透。
    */
   inputBusy() {
     return this.dragState.active || this.menuOpen || this.chatOpen;
@@ -967,11 +989,39 @@ class PetSprite {
    * 本方法表达"我有没有在用输入"（优先级更高，覆写常规判定）。
    */
   syncInputBusy() {
+    this.syncInputRegions();
     const busy = this.inputBusy();
     if (busy === this._inputBusy) return;
     this._inputBusy = busy;
     window.__dshPetDebug.inputBusy = busy;
     if (window.petBridge) window.petBridge.setInputBusy(busy);
+  }
+
+  syncInputRegions() {
+    if (!window.petBridge || !window.petBridge.setInputRegions) return;
+    const rects = [];
+    const controls = [...document.querySelectorAll('.dsh-pet-menu-column, .dsh-pet-chat')];
+    for (const el of this.inputRegionElements) {
+      if (!controls.includes(el)) {
+        this.inputRegionResize.unobserve(el);
+        this.inputRegionElements.delete(el);
+      }
+    }
+    for (const el of controls) {
+      if (!this.inputRegionElements.has(el)) {
+        this.inputRegionElements.add(el);
+        this.inputRegionResize.observe(el);
+      }
+      const r = el.getBoundingClientRect();
+      if (r.width > 0 && r.height > 0) {
+        rects.push({ x: toScreen(r.x), y: toScreen(r.y), width: toScreen(r.width), height: toScreen(r.height) });
+      }
+    }
+    const input = { dragging: this.dragState.active, rects };
+    const key = JSON.stringify(input);
+    if (key === this._inputRegions) return;
+    this._inputRegions = key;
+    window.petBridge.setInputRegions(input);
   }
 
   setInteractive(flag) {
@@ -1016,7 +1066,7 @@ class PetSprite {
       // 允许显示范围 = 窗口 ∩ 光标所在屏的工作区，两者必须取交集：
       // 只按窗口夹，窗口能贴到屏幕外，提示会被画到看不见的地方；只按工作区夹，提示会落到窗口外
       // （index.html 的 html,body 是 overflow:hidden，一样看不见）。
-      const area = S.resolveRect(AREAS, cursor.x, cursor.y) ?? { x: winX, y: winY, width: winW, height: winH };
+      const area = S.resolveRect(WORK_AREAS, cursor.x, cursor.y) ?? { x: winX, y: winY, width: winW, height: winH };
       const x0 = Math.max(winX, area.x);
       const y0 = Math.max(winY, area.y);
       const x1 = Math.min(winX + winW, area.x + area.width);
@@ -1048,6 +1098,7 @@ class PetSprite {
     }
     // 右键菜单/对话弹窗开启：整窗保持可交互（悬停菜单项/点输入框都不触发穿透翻转）；关闭后恢复命中区判定
     if (this.menuOpen || this.chatOpen) {
+      this.syncInputRegions(); // 级联菜单按悬停增减面板，及时更新其真实占用区域
       this.setInteractive(true);
       this.setTip(false); // 菜单/弹窗期间提示让位：光标已不在身体上，也不该跟浮层抢注意力
       return;
@@ -1099,7 +1150,7 @@ class PetSprite {
     // 比较双方都用屏幕坐标（坐标系不混），返回的夹取矩形仍是窗口局部坐标。
     // 夹取用**宠物所在的那块屏**而不是外接矩形：外接矩形含空洞，按它夹菜单会伸进
     // 不属于任何显示器的区域（看不见）；菜单本来也不该跨屏显示。
-    const area = S.resolveRect(AREAS, this.pos.x + this.halfW, this.pos.y + this.halfH);
+    const area = S.resolveRect(WORK_AREAS, this.pos.x + this.halfW, this.pos.y + this.halfH);
     if (!area) return null;
     const winX = this.pos.x + VIEW.x - this.margin.l;
     const winY = this.pos.y + VIEW.y - this.margin.t;
@@ -1154,9 +1205,11 @@ class PetSprite {
         this.menuOpen = false;
         window.__dshPetDebug.menuOpen = false;
         this.syncInputBusy();
+        if (!this.inputBusy()) this.setInteractive(false);
       },
     });
     this.menuClose = m.close;
+    this.syncInputRegions(); // mountContextMenu 完成布局后才能读取菜单矩形
   }
 
   onMenuAction(leaf) {
@@ -1208,6 +1261,7 @@ class PetSprite {
     this.menuOpen = false;
     window.__dshPetDebug.menuOpen = false;
     this.syncInputBusy(); // 菜单关：若没有别的占用（拖拽/弹窗）则交还常规判定
+    if (!this.inputBusy()) this.setInteractive(false);
   }
 
   // 「查看余额」菜单：POST 动作让 host 刷新余额（写进 S），随即**立刻跑一拍 /state** 拿结果展示
