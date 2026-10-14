@@ -26,7 +26,14 @@
  * （对话配图是点缀，不强制每句都带）。
  */
 
-import { BlockAssembler, createAssistantMessage, createUserMessage, ReasoningEffortId } from '@deepseek-ai/dsh-llm';
+import {
+  BlockAssembler,
+  createAssistantMessage,
+  createUserMessage,
+  ReasoningEffortId,
+  type ContentBlock,
+  type ImageBlock,
+} from '@deepseek-ai/dsh-llm';
 import { PET_CALL_IDENTITY, noTextReason } from './llm-call';
 import { supportsReasoningOff } from './llm-reasoning';
 import { extractChatImage, memeCatalog, type MemeEntry } from './memes';
@@ -42,6 +49,34 @@ export interface ChatMemoryMessage {
   role: 'user' | 'assistant';
   content: string;
   ts: number;
+}
+
+/**
+ * 随本轮提问附带的截图（已存为 attachment，走 dsh-llm 的 image 块）。
+ *
+ * 【为什么必须是 attachment 引用而不是 base64】dsh-llm 的 ImageBlock 只认
+ * `ImageAttachmentRef`——图片要先进 dsh-attachment 的 store 拿到内容寻址引用，
+ * 由请求组装期按路由预算再编码。直接把 base64 塞进 content 不是合法块，会被丢。
+ */
+export interface ChatImageInput {
+  /** 截图 JPEG 的 base64（无 data: 前缀）；由 host 存入 attachment 换成 ref */
+  data: string;
+  /** 媒体类型；截屏固定 image/jpeg */
+  mediaType: string;
+}
+
+/**
+ * 本插件用到的附件服务子集（`ctx.attachments`）。
+ *
+ * 【为什么用结构化类型而不是 import AttachmentStore】`@deepseek-ai/dsh-attachment`
+ * 只发 JS、不带 .d.ts，import 它必然 TS2307；而为一个方法新增一条 peerDependency 会
+ * 让插件多一个装不上就装不上的硬依赖。这里只声明真正调用的那一个方法，靠结构化类型
+ * 与实现方兼容——ctx.attachments 是注入的服务实例，鸭子类型匹配。
+ */
+interface AttachmentStoreLike {
+  saveImages(
+    inputs: ReadonlyArray<{ data: Uint8Array; mediaType: string; name?: string }>,
+  ): Promise<readonly unknown[]>;
 }
 
 /** 单次生成超时（ms）：对话等 LLM 回复，60s 足够 */
@@ -64,15 +99,25 @@ function imageInstruction(pool: MemeEntry[]): string {
  * @param userText 用户刚输入的话
  * @param pool 表情包候选池（开启对话配图时传入；空/缺省 = 纯文本，指令与解析都不介入）
  * @param preferred 条目配置单独指定的模型（chatModel）；缺省 / 留空 = 只用当前对话的模型
+ * @param image 随本轮提问附带的截图；缺省 = 纯文本提问（与旧行为逐字一致）
+ * @param memorySummary 「很久之前」的记忆摘要（记忆整理产出）；缺省 = 无摘要、
+ *   上下文里不出现摘要段（与旧行为逐字一致）。**不是**历史消息，故不放进 history 数组——
+ *   它进的是 system 尾部，语义是「背景设定」而不是「刚说过的话」，模型不会把它当新一轮对话回应。
  * @returns 回复文本（+ 命中池内的配图名），或结构化失败（provider 缺失 / 生成错误）
  */
 export async function generateChat(
-  ctx: { agentDefaultModel: { currentSelection(): { provider: string; model: string } }; llm?: unknown },
+  ctx: {
+    agentDefaultModel: { currentSelection(): { provider: string; model: string } };
+    llm?: unknown;
+    attachments?: AttachmentStoreLike;
+  },
   system: string,
   history: ChatMemoryMessage[],
   userText: string,
   pool: MemeEntry[] = [],
   preferred?: ModelRef,
+  image?: ChatImageInput,
+  memorySummary?: string,
 ): Promise<ChatGenerateResult> {
   // 候选链：配置的模型优先 → 当前对话的模型兜底（chatModel 留空时链上只有后者，与旧版逐字一致）
   const candidates = modelCandidates(ctx, preferred);
@@ -83,12 +128,33 @@ export async function generateChat(
   if (!llm || typeof llm.stream !== 'function') {
     return { ok: false, reason: 'generate-error', message: 'LLM 服务不可用' };
   }
+  // 截图先存成 attachment 拿引用：**只存一次**，不随候选链重试重复写盘（内容寻址，重试也只多一次
+  // 哈希比对）。存失败要显式报错而不是静默降级成纯文本提问——用户明确截了图，悄悄丢掉比报错更糟。
+  let imageRef: unknown;
+  if (image) {
+    const store = ctx.attachments;
+    if (!store || typeof store.saveImages !== 'function') {
+      return { ok: false, reason: 'generate-error', message: '附件服务不可用，无法发送截图' };
+    }
+    try {
+      const [ref] = await store.saveImages([
+        { data: Buffer.from(image.data, 'base64'), mediaType: image.mediaType, name: 'screen.jpg' },
+      ]);
+      imageRef = ref;
+    } catch (e) {
+      return {
+        ok: false,
+        reason: 'generate-error',
+        message: `截图保存失败：${e instanceof Error ? e.message : String(e)}`,
+      };
+    }
+  }
   // 依次尝试：配置的模型失败（凭据被删 / 模型下架 / 该服务商没配 key）时**回落到当前对话的模型
   // 重试一次**，仍失败才抛出失败原因——最后一次是用户当前真正在用的模型，报错更有意义。
   // 兜底文案与失败分支同源，避免两处字面量漂移
   let last: ChatGenerateResult = { ok: false, reason: 'generate-error', message: noTextReason(undefined) };
   for (const [i, sel] of candidates.entries()) {
-    const result = await generateWith(ctx, llm, sel, system, history, userText, pool);
+    const result = await generateWith(ctx, llm, sel, system, history, userText, pool, imageRef, memorySummary);
     if (result.ok) return result;
     last = result;
     // 回落要留痕：配的模型没生效时能在日志里看到原因（否则"我明明配了 A，怎么还是用 B"没法查）
@@ -110,6 +176,8 @@ async function generateWith(
   history: ChatMemoryMessage[],
   userText: string,
   pool: MemeEntry[],
+  imageRef?: unknown,
+  memorySummary?: string,
 ): Promise<ChatGenerateResult> {
   // 历史 → dsh-llm 消息：user 经 createUserMessage（plugin 来源），assistant 经 createAssistantMessage
   const historyMessages = history.map((m) =>
@@ -131,6 +199,24 @@ async function generateWith(
   const supportsOff = await supportsReasoningOff(ctx, sel.provider, sel.model);
   // 配图：池非空才把清单与指令附进 user 正文（空池 = 关闭配图，正文与旧行为逐字一致）
   const wantImage = pool.length > 0;
+  // user 消息 content 按需拼：截图（image 块）在前、正文（含配图指令）在后。
+  // 图片块必须在 content 数组里与文本并列，不能塞进某个 text 里——dsh-llm 按块类型路由。
+  const userContent: ContentBlock[] = [];
+  if (imageRef !== undefined) {
+    // ImageAttachmentRef 由 dsh-attachment 拥有、dsh-llm 只 import 不 re-export，
+    // 故这里从 ImageBlock 的字段派生该类型，避免直接名不存在的导入。
+    userContent.push({ type: 'image', attachment: imageRef as ImageBlock['attachment'] });
+  }
+  userContent.push({ type: 'text', text: wantImage ? userText + imageInstruction(pool) : userText });
+  // 远期记忆摘要拼进 system 尾部（不是 messages）：
+  //   - 语义上它是「背景设定：很久以前发生过这些」，不是「刚说过的话」，放 system 才对
+  //   - 放进 messages 会让模型以为那是一轮真实对话、甚至照着摘要续写回答
+  // 无摘要时 system 逐字不变（与旧行为一致），故这里只在非空时拼接。
+  const summary = memorySummary?.trim();
+  const systemWithMemory =
+    summary && summary.length > 0
+      ? `${system}\n\n【很久之前的记忆摘要】以下是更早的对话的大致内容（未必逐字准确），供你了解来龙去脉，不要逐句复述：\n${summary}`
+      : system;
   const options = {
     provider: sel.provider,
     model: sel.model,
@@ -139,11 +225,11 @@ async function generateWith(
     messages: [
       ...historyMessages,
       createUserMessage({
-        content: [{ type: 'text', text: wantImage ? userText + imageInstruction(pool) : userText }],
+        content: userContent,
         source: { kind: 'user' },
       }),
     ],
-    system,
+    system: systemWithMemory,
     // 不显式限 maxTokens：与碎碎念同因——推理模型把思考计入预算，显式小上限会截断正文；
     // 不传由 dsh-llm 按适配器 defaultMaxTokens 兜底，对话短回复输出仍短。
     temperature: 1,

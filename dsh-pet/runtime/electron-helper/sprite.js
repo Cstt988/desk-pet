@@ -1308,6 +1308,9 @@ class PetSprite {
     const m = S.mountChatDialog({
       petId: this.pet.id,
       baseUrl: BASE + '/chat',
+      // 截图提问：桌面端才有（浏览器没有 helper 进程，拿不到屏幕，故不传=不显示按钮）。
+      // BASE 已是 bridge/HTTP 的绝对前缀，直接拼 /screenshot。
+      captureUrl: BASE + '/screenshot',
       x: Math.max(4, this.hit.getBoundingClientRect().right + 6),
       y: Math.max(4, this.hit.getBoundingClientRect().top + 6),
       // 弹窗同菜单：只允许在「窗口 ∩ 工作区」内显示，贴边时不被屏幕裁掉（#41）

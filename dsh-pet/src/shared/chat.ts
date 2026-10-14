@@ -19,12 +19,13 @@ export type ChatSendState =
 const SEND_TIMEOUT_MS = 60_000; // 对话要等 LLM 生成回复，比碎碎念（30s）放宽一倍
 
 /** 发送一句对话（携带记忆去 host 生成回复并写入记忆）。
- *  网络/解析失败显式抛错（调用方决定报错方式，绝不静默伪造）。 */
-export async function sendChat(baseUrl: string, text: string): Promise<ChatSendState> {
+ *  网络/解析失败显式抛错（调用方决定报错方式，绝不静默伪造）。
+ *  @param image 可选截图（base64 JPEG，无 data: 前缀）；传入即随本轮提问发给多模态模型。 */
+export async function sendChat(baseUrl: string, text: string, image?: string): Promise<ChatSendState> {
   const res = await fetch(baseUrl, {
     method: 'POST',
     headers: { 'content-type': 'application/json' },
-    body: JSON.stringify({ text }),
+    body: JSON.stringify(image ? { text, image: { data: image, mediaType: 'image/jpeg' } } : { text }),
     signal: AbortSignal.timeout(SEND_TIMEOUT_MS),
   });
   const raw: unknown = await res.json().catch(() => null);
@@ -61,6 +62,13 @@ export const CHAT_CSS = [
   '.dsh-pet-chat-input::placeholder{color:rgba(43,43,43,.45)}',
   '.dsh-pet-chat-input:disabled{opacity:.55}',
   '.dsh-pet-chat-err{color:#d94f3d;font-size:12px;padding:0 12px 8px;white-space:pre-wrap;overflow-wrap:anywhere}',
+  // 截图提问按钮：与输入框同排的小图标按钮（仅桌面端注入 captureUrl 时出现）
+  '.dsh-pet-chat-row{display:flex;align-items:flex-end;gap:2px}',
+  '.dsh-pet-chat-shot{flex:0 0 auto;border:none;background:transparent;cursor:pointer;',
+  'padding:6px 8px 8px 2px;font-size:15px;line-height:1.45;color:rgba(43,43,43,.55)}',
+  '.dsh-pet-chat-shot:hover{color:#2b2b2b}',
+  '.dsh-pet-chat-shot:disabled{opacity:.4;cursor:default}',
+  '.dsh-pet-chat-shot.on{color:#2f7dd1}',
 ].join('');
 
 /** 输入框宽度自适应参数：初始小宽 → 随文本增宽 → 封顶后折行增高 */
@@ -107,11 +115,18 @@ export function mountChatDialog(opts: {
   onClose?: () => void;
   /** 弹窗允许占用的矩形（视口局部坐标）；缺省 = 整个视口 */
   clamp?: { x: number; y: number; w: number; h: number };
+  /**
+   * 截屏端点（桌面端传 `dsh-pet-bridge://dsh-pet/dsh-pet-7340/screenshot`）；
+   * **缺省 = 不显示截图按钮**——浏览器端没有 helper 进程，拿不到屏幕，故不提供入口，
+   * 而不是给一个点了就报错的按钮。
+   */
+  captureUrl?: string;
 }): ChatDialogMount {
   injectChatCss();
   const { petId, x, y, onSent, onClose, clamp } = opts;
   const baseUrl = opts.baseUrl ?? '/dsh-pet-7340/chat';
   const withPet = baseUrl + '?pet=' + encodeURIComponent(petId);
+  const captureUrl = opts.captureUrl;
   const c =
     clamp && Number.isFinite(clamp.x + clamp.y + clamp.w + clamp.h)
       ? clamp
@@ -148,7 +163,57 @@ export function mountChatDialog(opts: {
   err.className = 'dsh-pet-chat-err';
   err.style.display = 'none';
 
-  root.appendChild(input);
+  // 截图按钮（仅桌面端）：点一下抓屏并缓存，再点发送即随提问带上。
+  // 抓到的图放进 shot 变量、按钮变蓝作「已附截图」的唯一提示（不额外加预览——
+  // 弹窗只有一行，塞缩略图会把布局撑坏）。再点一次取消附截图。
+  let shot: string | undefined;
+  let shotting = false;
+  const shotBtn = document.createElement('button');
+  shotBtn.type = 'button';
+  shotBtn.className = 'dsh-pet-chat-shot';
+  shotBtn.textContent = '📷';
+  shotBtn.title = '截图提问（把当前屏幕一起发给桌宠）';
+
+  const row = document.createElement('div');
+  row.className = 'dsh-pet-chat-row';
+  row.appendChild(input);
+  if (captureUrl) {
+    row.appendChild(shotBtn);
+    shotBtn.addEventListener('click', () => {
+      if (closed || shotting) return;
+      // 已附截图 → 再点取消（避免用户想撤回却没有手段）
+      if (shot) {
+        shot = undefined;
+        shotBtn.classList.remove('on');
+        shotBtn.title = '截图提问（把当前屏幕一起发给桌宠）';
+        return;
+      }
+      shotting = true;
+      shotBtn.disabled = true;
+      fetch(captureUrl)
+        .then((r) => r.json() as Promise<{ ok?: boolean; data?: string; reason?: string }>)
+        .then((o) => {
+          if (o && o.ok === true && typeof o.data === 'string' && o.data.length > 0) {
+            shot = o.data;
+            shotBtn.classList.add('on');
+            shotBtn.title = '已附上截图，再点一次可取消';
+          } else {
+            err.textContent = '截图失败：' + (o && o.reason ? o.reason : '未知原因');
+            err.style.display = 'block';
+          }
+        })
+        .catch((e) => {
+          err.textContent = '截图异常：' + String(e && e.message ? e.message : e);
+          err.style.display = 'block';
+        })
+        .finally(() => {
+          shotting = false;
+          shotBtn.disabled = false;
+        });
+    });
+  }
+
+  root.appendChild(row);
   root.appendChild(err);
   document.body.appendChild(root);
 
@@ -184,10 +249,11 @@ export function mountChatDialog(opts: {
   const doSend = (): void => {
     if (closed || sending) return;
     const text = input.value.trim();
-    if (!text) return;
+    // 有截图时正文可空（用户可能只想问"这是什么"）；纯文本仍要求非空。
+    if (!text && !shot) return;
     sending = true;
     input.disabled = true;
-    sendChat(withPet, text)
+    sendChat(withPet, text, shot)
       .then((state) => {
         if (state.ok) {
           close();
