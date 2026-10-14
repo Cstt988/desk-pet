@@ -64,7 +64,10 @@ export const ID_FORBIDDEN = /[\\/:\x00-\x1f]/;
  *   - `chatImageLimit`：对话那张清单**最多几张**——同属 token 成本（清单每条消息都附）
  *   - `eventsRefreshSec`：多久调一次模型 / 拉一次余额 = 成本与节奏。注意它内部两个键的**消费端**
  *     不同：`.whisper` 按宠物所属条目读（种类可覆盖）；`.balance` 只读 main 条目
- *     （余额数据一份 + host 只有一个定时器，架构上给不了每种类一个周期）
+ *     （余额数据一份 + host 只有一个定时器，架构上给不了每种类一个周期）。
+ *     注：`.whisper` 的语义在情境化改造后是**最短间隔下限**（不再是"固定周期"）
+ *   - `whisperMaxSilenceSec`：桌宠最长沉默多久后必须说一句（0 = 不设上限）= 用户的
+ *     「打扰容忍度」，与"最短间隔"同一维度的节奏偏好，同属用户级
  *   - `physics`：拖拽抛掷手感；`petCollision` 更是**跨宠物**行为（相撞按动量守恒弹开），
  *     按种类分在语义上站不住：两只不同种类的宠物相撞时用谁的系数？
  *   - `confineToScreen`：多屏是用户环境 / 使用习惯，不是宠物属性
@@ -87,6 +90,7 @@ const GLOBAL_DEFAULT_KEYS = [
   'whisperModel',
   'chatModel',
   'eventsRefreshSec',
+  'whisperMaxSilenceSec',
 ] as const;
 
 /** 已告警过的 文件:字段（进程内去重：同一问题只告警一次，避免每请求刷屏；重启重置） */
@@ -347,6 +351,12 @@ function topFieldValid(key: string, value: unknown): boolean {
     }
     case 'notificationsEnabled':
       return typeof value === 'boolean';
+    case 'whisperMaxSilenceSec': {
+      // 碎碎念「最长静默」上限：0 = 不设上限（默认），> 0 = 超过该秒数后即便在忙也补一句。
+      // 负值/非法与缺失同处理（取默认 0）。
+      const n = Number(value);
+      return Number.isFinite(n) && n >= 0;
+    }
     case 'whisperImageEnabled':
       return typeof value === 'boolean';
     case 'chatImageEnabled':
@@ -701,6 +711,10 @@ export function saveUserConfig(
   if (mcm !== undefined && !topFieldValid('memoryCompactMaxChars', mcm)) return null;
   const mcp = o.memoryCompactPeriodSec;
   if (mcp !== undefined && !topFieldValid('memoryCompactPeriodSec', mcp)) return null;
+  // whisperMaxSilenceSec（碎碎念最长静默上限；设置页「AI 模型与对话上下文」区的数字输入框写的
+  // 就是它）：与记忆整理四件套同一套语义——传了就校验后进白名单，没传则透传保留。
+  const wms = o.whisperMaxSilenceSec;
+  if (wms !== undefined && !topFieldValid('whisperMaxSilenceSec', wms)) return null;
   const cleanModel = (v: Record<string, unknown>): { provider: string; model: string } => ({
     provider: String(v.provider).trim(),
     model: String(v.model).trim(),
@@ -723,6 +737,7 @@ export function saveUserConfig(
   if (mck !== undefined) outConfig.memoryCompactKeepRounds = Number(mck);
   if (mcm !== undefined) outConfig.memoryCompactMaxChars = Number(mcm);
   if (mcp !== undefined) outConfig.memoryCompactPeriodSec = Number(mcp);
+  if (wms !== undefined) outConfig.whisperMaxSilenceSec = Number(wms);
   // 透传保留：请求体未携带的顶层字段，从 existing（磁盘现有用户文件）原样带回——
   // 设置页只提交 pets(+全局开关+physics+模型+对话历史条数)，手改的 whisperPrompt/memes/... 借此保住。
   // 白名单字段只在「请求体传了」时才算白名单（已由上方写入）；未传时走这里透传磁盘旧值——
@@ -741,6 +756,7 @@ export function saveUserConfig(
   if (mck !== undefined) bodyOwned.add('memoryCompactKeepRounds');
   if (mcm !== undefined) bodyOwned.add('memoryCompactMaxChars');
   if (mcp !== undefined) bodyOwned.add('memoryCompactPeriodSec');
+  if (wms !== undefined) bodyOwned.add('whisperMaxSilenceSec');
   if (existing && typeof existing === 'object') {
     for (const key of Object.keys(existing)) {
       if (bodyOwned.has(key)) continue; // 白名单字段由请求体决定

@@ -25,11 +25,20 @@ import { BlockAssembler, createUserMessage, ReasoningEffortId } from '@deepseek-
 import { PET_CALL_IDENTITY, noTextReason } from './llm-call';
 import { supportsReasoningOff } from './llm-reasoning';
 import { modelCandidates, modelLabel, type ModelRef } from './model-selection';
+import { toneInstruction, type WhisperTone } from './whisper-situation';
 
 /** 生成失败原因（与 shared/whisper.ts 的 WhisperState 失败分支同构） */
 export type WhisperGenerateResult =
   | { ok: true; text: string; image?: string }
   | { ok: false; reason: 'provider-missing' | 'generate-error'; message?: string };
+
+/** 碎碎念相关默认值集中在这里，避免散落在多处字面量（与 memory-compact 的 COMPACT_DEFAULTS 同一约定） */
+export const WHISPER_DEFAULTS = {
+  /** 最短间隔下限（秒）：eventsRefreshSec.whisper 的兜底值，也是"固定周期"时代的原默认值 */
+  minIntervalSec: 300,
+  /** 最长静默上限（秒）：0 = 不设上限（默认不设——多数用户不希望被打扰，宁可桌宠少说话） */
+  maxSilenceSec: 0,
+} as const;
 
 /** 单次生成超时（ms）：骈骈念不需要长输出，30s 足够 */
 const TIMEOUT_MS = 30_000;
@@ -54,12 +63,26 @@ function userTextWithMeme(meme: { name: string; desc: string }): string {
 }
 
 /**
+ * 拼最终 user 指令：基础指令 + 可选配图要求 + 可选情境语气要求。
+ *
+ * 语气要求来自情境判断（whisper-situation.ts）：tone 为 casual 时 toneInstruction 返回 null，
+ * 这时**输出与改造前的字面量逐字一致**（零回归）。celebrate / comfort 各追加一句，
+ * 让"刚出结果"和"出错后"说出来的话有区别，而不是任何场合都同一句"随便说一句"。
+ */
+function buildUserText(meme: { name: string; desc: string } | undefined, tone: WhisperTone): string {
+  const base = meme ? userTextWithMeme(meme) : USER_TEXT;
+  const extra = toneInstruction(tone);
+  return extra ? base + '\n' + extra : base;
+}
+
+/**
  * 用指定（或当前对话的）provider/model 生成一句碎碎念。
  * @param ctx 宿主上下文（注入 agentDefaultModel / llm）
  * @param system 人设提示词（whisperPrompt）
  * @param meme 配图（开启配图时传入；缺省 = 纯文本碎碎念）。生成成功时原样带回，
  *             客户端据此展示图片（host 不判断模型是否真的贴合）
  * @param preferred 条目配置单独指定的模型（whisperModel）；缺省 / 留空 = 只用当前对话的模型
+ * @param tone 情境语气（celebrate / comfort / casual）；缺省 casual = 与改造前逐字一致
  * @returns 生成的文本（+ 配图），或结构化失败（provider 缺失 / 生成错误）
  */
 export async function generateWhisper(
@@ -67,6 +90,7 @@ export async function generateWhisper(
   system: string,
   meme?: { name: string; desc: string },
   preferred?: ModelRef,
+  tone: WhisperTone = 'casual',
 ): Promise<WhisperGenerateResult> {
   // 候选链：配置的模型优先 → 当前对话的模型兜底（whisperModel 留空时链上只有后者，与旧版逐字一致）
   const candidates = modelCandidates(ctx, preferred);
@@ -83,7 +107,7 @@ export async function generateWhisper(
   // 兜底文案与失败分支同源，避免两处字面量漂移
   let last: WhisperGenerateResult = { ok: false, reason: 'generate-error', message: noTextReason(undefined) };
   for (const [i, sel] of candidates.entries()) {
-    const result = await generateWith(ctx, llm, sel, system, meme);
+    const result = await generateWith(ctx, llm, sel, system, meme, tone);
     if (result.ok) return result;
     last = result;
     // 回落要留痕：配的模型没生效时能在日志里看到原因（否则"我明明配了 A，怎么还是用 B"没法查）
@@ -103,6 +127,7 @@ async function generateWith(
   sel: ModelRef,
   system: string,
   meme?: { name: string; desc: string },
+  tone: WhisperTone = 'casual',
 ): Promise<WhisperGenerateResult> {
   const deadline = AbortSignal.timeout(TIMEOUT_MS);
   // 仅当模型声明支持 reasoning effort（含 "off"）时才传，否则省略：
@@ -116,7 +141,7 @@ async function generateWith(
     sessionId: PET_CALL_IDENTITY,
     messages: [
       createUserMessage({
-        content: [{ type: 'text', text: meme ? userTextWithMeme(meme) : USER_TEXT }],
+        content: [{ type: 'text', text: buildUserText(meme, tone) }],
         source: { kind: 'user' },
       }),
     ],

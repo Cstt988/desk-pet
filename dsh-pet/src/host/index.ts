@@ -69,7 +69,9 @@ import { fileURLToPath } from 'node:url';
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths';
 import { credentialRef } from '@deepseek-ai/dsh-credentials';
 import { queryBalance } from './balance/index';
-import { generateWhisper } from './whisper';
+import { generateWhisper, WHISPER_DEFAULTS } from './whisper';
+import { decideWhisper, type WhisperTone } from './whisper-situation';
+import { dayKindOf, timeSlotOf } from './time-context';
 import { generateChat, type ChatImageInput } from './chat';
 import { COMPACT_DEFAULTS, compactPetMemory, type PetMemory } from './memory-compact';
 import { configuredModel } from './model-selection';
@@ -464,13 +466,18 @@ export function apply(ctx: any): void {
     return Number.isFinite(v) && v >= 0 ? v : COMPACT_DEFAULTS.periodSec;
   };
 
-  /** 生成/返回某宠物的一句碎碎念（周期 GET 与菜单手动触发共用的同一逻辑）：
+  /** 生成/返回某宠物的一句碎碎念（周期调度与菜单手动触发共用的同一逻辑）：
    *  每只宠物独立生成（所属条目的人设）。生成成功就写进 S 的 pets.<id>.say——
    *  碎碎念 / 命令气泡 / 对话回复在前端本来就是**同一条展示链路**（同一个 triggerWhisper、
-   *  同一个气泡槽、同一批 events.whisper 动画），所以合并成同一个叶子；"周期内不重复"由
+   *  同一个气泡槽、同一批 events.whisper 动画），所以合并成同一个叶子；"间隔下限内不重复"由
    *  调度侧的 lastWhisperAt 保证，不再需要一份 whisperCache（多端共享也由 S 天然保证）。
-   *  配图（whisperImageEnabled 开启时）：从表情包池**随机抽 1 张**，把描述注入指令并随文本一起写。 */
-  const publishWhisper = async (petId: string): Promise<boolean> => {
+   *  配图（whisperImageEnabled 开启时）：从表情包池**随机抽 1 张**，把描述注入指令并随文本一起写。
+   *
+   *  @param tone 情境判断给出的调子（见 whisper-situation.ts）：celebrate 刚出结果、
+   *    comfort 出错后的关心、casual 日常。**手动触发（菜单/命令）不传** = casual，
+   *    与原行为逐字一致（用户主动点"说一句"时不需要桌宠自己判断场合）。
+   */
+  const publishWhisper = async (petId: string, tone: WhisperTone = 'casual'): Promise<boolean> => {
     const cfg = readAllConfig(configPaths);
     const found = findPetInstance(cfg, petId);
     const conf = found ? found.conf : (cfg.main ?? {});
@@ -479,7 +486,7 @@ export function apply(ctx: any): void {
     // 配图：全局开关关闭 / 池为空 / 池内图片全缺失 → 纯文本（不报错，退化为原行为）
     const meme = conf.whisperImageEnabled === true ? pickMeme(readMemePool(conf.memes, memeDirsFor(entry))) : undefined;
     // 模型：条目配置的 whisperModel 优先（留空 = 不指定）；生成侧失败会回落到当前对话的模型重试一次
-    const result = await generateWhisper(ctx, system, meme, configuredModel(conf, 'whisperModel'));
+    const result = await generateWhisper(ctx, system, meme, configuredModel(conf, 'whisperModel'), tone);
     if (!result.ok) {
       // 失败**不写 S**（与改造前一致：静默跳过 + console.warn，不伪造文案、不弹错误气泡）
       console.warn(
@@ -599,12 +606,25 @@ export function apply(ctx: any): void {
     return Number.isFinite(n) && n > 0 ? n : 1800;
   };
 
-  /** 碎碎念周期（秒）：该宠物**所属条目**的 eventsRefreshSec.whisper（合并器已填默认；非法兜底 300） */
-  const whisperPeriodSec = (cfg: Record<string, Record<string, unknown>>, petId: string): number => {
+  /**
+   * 碎碎念**最短间隔下限**（秒）：该宠物所属条目的 eventsRefreshSec.whisper（合并器已填默认）。
+   *
+   * 语义变更（原为"固定周期"）：现在它不再决定"何时冒泡"，只保证"不比这个更频繁"。
+   * 真正决定该不该说一句的是情境判断（host/whisper-situation.ts）——见下方调度器的注释。
+   * 键名与默认值都不变，因此**老配置无需改动**，只是行为从"到点必说"变成"最多这么频"。
+   */
+  const whisperMinIntervalSec = (cfg: Record<string, Record<string, unknown>>, petId: string): number => {
     const conf = (findPetInstance(cfg, petId) ?? { conf: cfg.main ?? {} }).conf;
     const ers = conf.eventsRefreshSec as Record<string, unknown> | undefined;
     const n = Number(ers?.whisper);
     return Number.isFinite(n) && n > 0 ? n : 300;
+  };
+
+  /** 碎碎念「最长静默」上限（秒）：0 / 非法 = 不设上限（该宠物所属条目；默认 0） */
+  const whisperMaxSilenceSec = (cfg: Record<string, Record<string, unknown>>, petId: string): number => {
+    const conf = (findPetInstance(cfg, petId) ?? { conf: cfg.main ?? {} }).conf;
+    const n = Number(conf.whisperMaxSilenceSec);
+    return Number.isFinite(n) && n > 0 ? n : WHISPER_DEFAULTS.maxSilenceSec;
   };
 
   /**
@@ -1505,10 +1525,18 @@ export function apply(ctx: any): void {
     };
   }, 'dsh-pet: balance poll');
 
-  // 碎碎念周期：host 侧调度（前端不再有任何碎碎念定时器）。
-  // 一拍 = 读一次配置 + 给"到点"的宠物各生成一句；下一拍按**最短周期**排（多数部署只有一个
-  // 周期值，那它就是那个值）。用"读一次配置 + 逐宠物比对 lastWhisperAt"而不是每宠一个定时器：
-  // 宠物随配置增删、周期随条目改，固定拍天然跟上，不用维护一堆定时器的生命周期。
+  // 碎碎念调度：host 侧唯一调度点（前端不再有任何碎碎念定时器）。
+  //
+  // **改造要点（原为纯定时器）**：过去"到点必说一句"，跟钟表走、不看场合——正忙时插科打诨、
+  // 深夜照样冒泡、刚出结果时反而沉默。现在改成**情境驱动**：
+  //   - 每拍不是"谁到点了"，而是"谁【此刻该说话】"（decideWhisper，纯函数可单测）
+  //   - eventsRefreshSec.whisper 从"固定周期"降级为"最短间隔下限"（硬闸，任何情境都不能突破）
+  //   - 忙碌（thinking/working/waiting/error）静默；刚出结果（success/result）说一句；
+  //     深夜要求 4 倍间隔；可选 whisperMaxSilenceSec 保证不会永远沉默
+  // 判断完全本地（不调模型）——否则"判断该不该说"比"生成那句话"还贵。
+  //
+  // 拍长仍按**最短间隔**排（不必逐秒轮询）：情境判断依赖的状态变化（工作状态/时段）粒度都在
+  // 分钟级以上，按最小间隔醒来足够灵敏，且不浪费常驻定时器。
   ctx.effect(() => {
     let disposed = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
@@ -1521,16 +1549,35 @@ export function apply(ctx: any): void {
       try {
         const cfg = readAllConfig(configPaths);
         const now = Date.now();
+        // 情境信号只采一次（同一拍里所有宠物共享同一时刻的时钟/工作状态）
+        const date = new Date(now);
+        const slot = timeSlotOf(date.getHours());
+        const weekend = dayKindOf(date.getDay()) === '周末';
+        // 工作状态：null = 尚无会话活动（空闲）。取全局展示快照——
+        // 碎碎念是桌宠级行为，用"当前最忙的那个会话"作整体情境最合理
+        // （某个会话在跑就不该在另一个会话的桌宠上插话）。
+        const workState = workStatus.snapshot().state;
         let min = Infinity;
         for (const pet of flattenPetList(cfg)) {
           const petId = String(pet.id ?? '');
           if (!petId || pet.whisperEnabled !== true) continue;
-          const sec = whisperPeriodSec(cfg, petId);
-          min = Math.min(min, sec);
-          if (now - (lastWhisperAt.get(petId) ?? 0) < sec * 1000) continue;
+          const minIntervalSec = whisperMinIntervalSec(cfg, petId);
+          min = Math.min(min, minIntervalSec);
+          const sinceLastMs = now - (lastWhisperAt.get(petId) ?? 0);
+          const decision = decideWhisper({
+            workState,
+            sinceLastMs,
+            minIntervalSec,
+            timeSlot: slot,
+            isWeekend: weekend,
+            maxSilenceSec: whisperMaxSilenceSec(cfg, petId),
+          });
+          if (!decision.speak) continue;
+          // 记时间戳**在这里**（生成前）：语义是"这次尝试过了"。
+          // 失败不重试是刻意的——见下方 publishWhisper 失败分支的注释。
           lastWhisperAt.set(petId, now);
           // 不 await：生成要几秒，别把调度拍拖住（每只宠物独立生成，互不阻塞）
-          void publishWhisper(petId).catch(() => {});
+          void publishWhisper(petId, decision.tone).catch(() => {});
         }
         if (Number.isFinite(min)) next = min;
       } catch {
@@ -1539,7 +1586,7 @@ export function apply(ctx: any): void {
       }
       arm(next);
     }
-    void tick(); // 启动即生成一次（与改造前客户端首拉就生成一致）
+    void tick(); // 启动即判断一次（与改造前的首拉一致）
     return () => {
       disposed = true;
       if (timer !== null) clearTimeout(timer);
