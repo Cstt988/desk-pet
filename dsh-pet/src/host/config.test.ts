@@ -623,6 +623,65 @@ describe('saveUserConfig —— 对话配图张数上限 chatImageLimit（白名
   });
 });
 
+describe('saveUserConfig —— 记忆整理四件套（白名单 + 透传保留）', () => {
+  test('随请求体写入（设置页数字输入框）', () => {
+    const out = saveOnce({
+      pets: PETS,
+      memoryCompactDays: 30,
+      memoryCompactKeepRounds: 10,
+      memoryCompactMaxChars: 800,
+      memoryCompactPeriodSec: 21600,
+    });
+    assert.equal(out?.memoryCompactDays, 30, 'memoryCompactDays 必须在白名单里');
+    assert.equal(out?.memoryCompactKeepRounds, 10);
+    assert.equal(out?.memoryCompactMaxChars, 800);
+    assert.equal(out?.memoryCompactPeriodSec, 21600);
+  });
+
+  test('落盘时归一化成数字（设置页传的是字符串）', () => {
+    const out = saveOnce({ pets: PETS, memoryCompactDays: '7', memoryCompactKeepRounds: '3' });
+    assert.equal(out?.memoryCompactDays, 7);
+    assert.equal(out?.memoryCompactKeepRounds, 3);
+  });
+
+  test('period = 0 合法（= 关闭记忆整理）', () => {
+    assert.equal(saveOnce({ pets: PETS, memoryCompactPeriodSec: 0 })?.memoryCompactPeriodSec, 0);
+  });
+
+  test('未传时透传磁盘旧值；磁盘上也没有则不凭空造字段', () => {
+    const kept = saveOnce({ pets: PETS }, { pets: PETS, memoryCompactDays: 15 });
+    assert.equal(kept?.memoryCompactDays, 15, '未传时必须原样保留磁盘上的手改值');
+    assert.equal(
+      'memoryCompactPeriodSec' in (saveOnce({ pets: PETS }) ?? {}),
+      false,
+      '磁盘上也没有时不得凭空写入',
+    );
+  });
+
+  test('请求体覆盖磁盘旧值', () => {
+    const out = saveOnce({ pets: PETS, memoryCompactDays: 30 }, { pets: PETS, memoryCompactDays: 15 });
+    assert.equal(out?.memoryCompactDays, 30, '请求体优先，不被 existing 反向覆盖');
+  });
+
+  test('非法值 → 整体拒绝（与读取侧 topFieldValid 同一套规则）', () => {
+    const bad: Array<[string, unknown]> = [
+      ['负数', -1],
+      ['非数字字符串', 'soon'],
+      ['对象', { n: 3 }],
+      ['Infinity', Infinity],
+      ['NaN', NaN],
+    ];
+    for (const key of ['memoryCompactDays', 'memoryCompactKeepRounds', 'memoryCompactMaxChars', 'memoryCompactPeriodSec']) {
+      for (const [name, value] of bad) {
+        assert.equal(saveOnce({ pets: PETS, [key]: value }), null, `${key} 的${name}必须被拒绝`);
+      }
+    }
+    // days / maxChars 为 0 在各自语义下无意义（要停用整理请用 period = 0）
+    assert.equal(saveOnce({ pets: PETS, memoryCompactDays: 0 }), null, 'days=0 必须被拒绝');
+    assert.equal(saveOnce({ pets: PETS, memoryCompactMaxChars: 0 }), null, 'maxChars=0 必须被拒绝');
+  });
+});
+
 describe('readAllConfig —— 模型选择合并（缺失取默认 / 非法回退默认）', () => {
   const WM = { provider: 'deepseek', model: 'deepseek-chat' };
 

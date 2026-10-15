@@ -7,7 +7,8 @@
 //   · 全局默认（本文件是默认值；用户在 main-config.jsonc 里写一次就对**所有宠物**生效，
 //     含 pet/<名>-config.json 定义的种类；种类文件自己写了则覆盖自己那份）：
 //     physics / confineToScreen / whisperImageEnabled / chatImageEnabled /
-//     chatMemoryRounds / whisperModel / chatModel / eventsRefreshSec
+//     chatMemoryRounds / memoryCompactDays / memoryCompactKeepRounds /
+//     memoryCompactMaxChars / memoryCompactPeriodSec / whisperModel / chatModel / eventsRefreshSec
 //   · 条目级（每个条目一份：main 一份、每个种类各一份；种类文件顶层可覆盖）：
 //     whisperPrompt / memes / workStatusTexts / animations / animationWeights
 //   · 只读 main（写了也只认 main 条目那份）：notificationsEnabled / eventsRefreshSec.balance
@@ -24,6 +25,28 @@
   // 写了非法（负数/非数字）即配置错误。回落链同 whisperPrompt：种类文件顶层 → 全局 → 默认 5。
   // 设置页「AI 模型与对话上下文」区有数字输入框，改这里或那里等价（设置页写的是用户层）。
   "chatMemoryRounds": 5,
+  // ===================== 记忆整理：多久以前算「很久之前」（全局默认；种类文件顶层可覆盖） =====================
+  // 背景：memory.json 原本只增不减——chatMemoryRounds 只决定"带多少历史进上下文"，
+  // 对文件大小没有任何作用，聊得越多文件越大。记忆整理把**很久以前**的消息压成一段
+  // 「大体意思」摘要（存进同一条记忆的 summary 字段），原文随即从文件里移除。
+  // 本项 = 多少天以前的消息才允许被压。正数，缺失默认 30。
+  // 注意：最近 memoryCompactKeepRounds 轮**永远保留原文**，与本项无关（近事要原汁原味）。
+  "memoryCompactDays": 30,
+  // ===================== 记忆整理：永远保留原文的最近轮数（全局默认；种类文件顶层可覆盖） =====================
+  // 无论多久以前，最近这么多轮对话都原样保留（1 轮 = 1 问 1 答）。非负整数，缺失默认 10。
+  // 设为 0 = 不做此豁免（只要够旧就压）；设为很大 = 实际上等于关闭整理。
+  "memoryCompactKeepRounds": 10,
+  // ===================== 记忆整理：摘要正文上限字符数（全局默认；种类文件顶层可覆盖） =====================
+  // 模型产出的摘要会被截到此长度（超出加省略号）。正数，缺失默认 800。
+  // 为什么要它：摘要是**每次对话都要附带**的上下文（进 system），太长就变成新的 token 负担；
+  // 800 字足以记住"聊过什么、用户什么偏好、有什么没做完"，又不至于喧宾夺主。
+  "memoryCompactMaxChars": 800,
+  // ===================== 记忆整理：整理周期秒数（全局默认；只读 main 条目那份） =====================
+  // 每隔多少秒检查并整理一次所有宠物的记忆。非负整数，缺失默认 21600（6 小时）。
+  // **0 = 完全关闭记忆整理**（memory.json 恢复成只增不减的旧行为）。
+  // 整理是幂等的：没有需要压的消息时只读一次文件、不调模型、不写盘，所以周期设短些也无妨。
+  // 只有真正要压东西时才会调用一次模型（用 chatModel，未配置则跟随当前对话）。
+  "memoryCompactPeriodSec": 21600,
   // ===================== 碎碎念模型（全局默认：用户层写了对所有宠物生效；种类文件 pet/<名>-config.json 顶层可覆盖） =====================
   // 碎碎念用哪个服务商 + 模型生成。provider 与 model **都留空 = 跟随当前对话的模型**（默认，与旧行为一致）；
   // 想给后台自动跑的碎碎念单独用便宜/快的模型就填上（设置页有下拉框，选项与 DSH 的模型选择器同源）。

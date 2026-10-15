@@ -57,12 +57,18 @@ export const ID_FORBIDDEN = /[\\/:\x00-\x1f]/;
  *
  * 判据：这几个是**用户级「成本 / 偏好 / 环境 / 节奏」参数**，不是「这个种类长什么样」——
  *   - `chatMemoryRounds`：带多少历史进上下文 = token 成本
+ *   - `memoryCompactDays` / `memoryCompactKeepRounds` / `memoryCompactMaxChars` /
+ *     `memoryCompactPeriodSec`：记忆整理（多久整理一次、多久以前的算「很久之前」、
+ *     永远保留多少轮原文、摘要正文上限）= 磁盘占用与远期记忆的取舍，属用户级偏好
  *   - `whisperModel` / `chatModel`：碎碎念 / 对话用哪个模型 = 成本与能力偏好
  *   - `whisperImageEnabled` / `chatImageEnabled`：要不要把表情包清单附进请求 = token 成本
  *   - `chatImageLimit`：对话那张清单**最多几张**——同属 token 成本（清单每条消息都附）
  *   - `eventsRefreshSec`：多久调一次模型 / 拉一次余额 = 成本与节奏。注意它内部两个键的**消费端**
  *     不同：`.whisper` 按宠物所属条目读（种类可覆盖）；`.balance` 只读 main 条目
- *     （余额数据一份 + host 只有一个定时器，架构上给不了每种类一个周期）
+ *     （余额数据一份 + host 只有一个定时器，架构上给不了每种类一个周期）。
+ *     注：`.whisper` 的语义在情境化改造后是**最短间隔下限**（不再是"固定周期"）
+ *   - `whisperMaxSilenceSec`：桌宠最长沉默多久后必须说一句（0 = 不设上限）= 用户的
+ *     「打扰容忍度」，与"最短间隔"同一维度的节奏偏好，同属用户级
  *   - `physics`：拖拽抛掷手感；`petCollision` 更是**跨宠物**行为（相撞按动量守恒弹开），
  *     按种类分在语义上站不住：两只不同种类的宠物相撞时用谁的系数？
  *   - `confineToScreen`：多屏是用户环境 / 使用习惯，不是宠物属性
@@ -78,9 +84,14 @@ const GLOBAL_DEFAULT_KEYS = [
   'chatImageEnabled',
   'chatImageLimit',
   'chatMemoryRounds',
+  'memoryCompactDays',
+  'memoryCompactKeepRounds',
+  'memoryCompactMaxChars',
+  'memoryCompactPeriodSec',
   'whisperModel',
   'chatModel',
   'eventsRefreshSec',
+  'whisperMaxSilenceSec',
 ] as const;
 
 /** 已告警过的 文件:字段（进程内去重：同一问题只告警一次，避免每请求刷屏；重启重置） */
@@ -358,6 +369,28 @@ function topFieldValid(key: string, value: unknown): boolean {
       const n = Number(value);
       return Number.isFinite(n) && n >= 0;
     }
+    // 记忆整理四件套：
+    //   memoryCompactDays     —— 超过多少天的消息算「很久之前」（> 0；0 在此语义下无意义，
+    //                            要停用整理请把 period 设 0 或直接清空记忆，不靠 days=0）
+    //   memoryCompactKeepRounds —— 永远保留原文的最近轮数（>= 0）
+    //   memoryCompactMaxChars   —— 摘要正文上限字符数（> 0，防模型啰嗦把摘要本身撑爆）
+    //   memoryCompactPeriodSec  —— 整理周期秒数（0 = 关闭整理；> 0 生效）
+    case 'memoryCompactDays': {
+      const n = Number(value);
+      return Number.isFinite(n) && n > 0;
+    }
+    case 'memoryCompactKeepRounds': {
+      const n = Number(value);
+      return Number.isFinite(n) && n >= 0;
+    }
+    case 'memoryCompactMaxChars': {
+      const n = Number(value);
+      return Number.isFinite(n) && n > 0;
+    }
+    case 'memoryCompactPeriodSec': {
+      const n = Number(value);
+      return Number.isFinite(n) && n >= 0;
+    }
     case 'chatImageLimit': {
       // 对话配图张数上限：非负数字（0 = 不限制）；小数按消费者 Math.floor 取整
       const n = Number(value);
@@ -365,6 +398,12 @@ function topFieldValid(key: string, value: unknown): boolean {
     }
     case 'notificationsEnabled':
       return typeof value === 'boolean';
+    case 'whisperMaxSilenceSec': {
+      // 碎碎念「最长静默」上限：0 = 不设上限（默认），> 0 = 超过该秒数后即便在忙也补一句。
+      // 负值/非法与缺失同处理（取默认 0）。
+      const n = Number(value);
+      return Number.isFinite(n) && n >= 0;
+    }
     case 'whisperImageEnabled':
       return typeof value === 'boolean';
     case 'chatImageEnabled':
@@ -709,6 +748,20 @@ export function saveUserConfig(
   // 与 chatMemoryRounds 同一套语义——传了就校验后进白名单，没传则走下面的透传保留。
   const cil = o.chatImageLimit;
   if (cil !== undefined && !topFieldValid('chatImageLimit', cil)) return null;
+  // 记忆整理四件套（与 chatMemoryRounds 同一套语义：传了就校验后进白名单，没传则透传保留）。
+  // 校验直接复用读取侧的 topFieldValid，读写同一份规则，不另写一套。
+  const mcd = o.memoryCompactDays;
+  if (mcd !== undefined && !topFieldValid('memoryCompactDays', mcd)) return null;
+  const mck = o.memoryCompactKeepRounds;
+  if (mck !== undefined && !topFieldValid('memoryCompactKeepRounds', mck)) return null;
+  const mcm = o.memoryCompactMaxChars;
+  if (mcm !== undefined && !topFieldValid('memoryCompactMaxChars', mcm)) return null;
+  const mcp = o.memoryCompactPeriodSec;
+  if (mcp !== undefined && !topFieldValid('memoryCompactPeriodSec', mcp)) return null;
+  // whisperMaxSilenceSec（碎碎念最长静默上限；设置页「AI 模型与对话上下文」区的数字输入框写的
+  // 就是它）：与记忆整理四件套同一套语义——传了就校验后进白名单，没传则透传保留。
+  const wms = o.whisperMaxSilenceSec;
+  if (wms !== undefined && !topFieldValid('whisperMaxSilenceSec', wms)) return null;
   const cleanModel = (v: Record<string, unknown>): { provider: string; model: string } => ({
     provider: String(v.provider).trim(),
     model: String(v.model).trim(),
@@ -726,6 +779,12 @@ export function saveUserConfig(
   // 数值归一化落盘：请求体传 "9" 也存成 9（与读取侧 topFieldValid 的 Number() 口径一致）
   if (cmr !== undefined) outConfig.chatMemoryRounds = Number(cmr);
   if (cil !== undefined) outConfig.chatImageLimit = Number(cil);
+  // 记忆整理四件套同样归一化：设置页的数字输入框传的是字符串，统一按 Number() 落盘
+  if (mcd !== undefined) outConfig.memoryCompactDays = Number(mcd);
+  if (mck !== undefined) outConfig.memoryCompactKeepRounds = Number(mck);
+  if (mcm !== undefined) outConfig.memoryCompactMaxChars = Number(mcm);
+  if (mcp !== undefined) outConfig.memoryCompactPeriodSec = Number(mcp);
+  if (wms !== undefined) outConfig.whisperMaxSilenceSec = Number(wms);
   // 透传保留：请求体未携带的顶层字段，从 existing（磁盘现有用户文件）原样带回——
   // 设置页只提交 pets(+全局开关+physics+模型+对话历史条数)，手改的 whisperPrompt/memes/... 借此保住。
   // 白名单字段只在「请求体传了」时才算白名单（已由上方写入）；未传时走这里透传磁盘旧值——
@@ -740,6 +799,11 @@ export function saveUserConfig(
   if (cm !== undefined) bodyOwned.add('chatModel');
   if (cmr !== undefined) bodyOwned.add('chatMemoryRounds');
   if (cil !== undefined) bodyOwned.add('chatImageLimit');
+  if (mcd !== undefined) bodyOwned.add('memoryCompactDays');
+  if (mck !== undefined) bodyOwned.add('memoryCompactKeepRounds');
+  if (mcm !== undefined) bodyOwned.add('memoryCompactMaxChars');
+  if (mcp !== undefined) bodyOwned.add('memoryCompactPeriodSec');
+  if (wms !== undefined) bodyOwned.add('whisperMaxSilenceSec');
   if (existing && typeof existing === 'object') {
     for (const key of Object.keys(existing)) {
       if (bodyOwned.has(key)) continue; // 白名单字段由请求体决定

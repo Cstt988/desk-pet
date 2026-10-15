@@ -69,8 +69,11 @@ import { fileURLToPath } from 'node:url';
 import { resolveDshHome } from '@deepseek-ai/dsh-home-paths';
 import { credentialRef } from '@deepseek-ai/dsh-credentials';
 import { queryBalance } from './balance/index';
-import { generateWhisper } from './whisper';
-import { generateChat, type ChatMemoryMessage } from './chat';
+import { generateWhisper, WHISPER_DEFAULTS } from './whisper';
+import { decideWhisper, type WhisperTone } from './whisper-situation';
+import { dayKindOf, timeSlotOf } from './time-context';
+import { generateChat, type ChatImageInput } from './chat';
+import { COMPACT_DEFAULTS, compactPetMemory, type PetMemory } from './memory-compact';
 import { configuredModel } from './model-selection';
 import { limitPool, pickMeme, readMemePool } from './memes';
 import { decideBroadcast, normalizeBroadcastText } from './broadcast';
@@ -115,7 +118,17 @@ import {
 /** 插件行 id（与 cordis.patch.yml 一致） */
 export const name = 'pet';
 /** 需要注入的服务：webServer（路由）+ agentDefaultModel（当前服务商）+ credentials（凭证）+ llm（对话模型调用）+ commands（/balance 斜杠命令）+ connection（桌面 Helper「打开网站」用的已鉴权站点 URL） */
-export const inject = ['webServer', 'agentDefaultModel', 'credentials', 'llm', 'commands', 'connection'];
+export const inject = [
+  'webServer',
+  'agentDefaultModel',
+  'credentials',
+  'llm',
+  'commands',
+  'connection',
+  // 附件服务：对话带截图时用它把 JPEG 存成 attachment 拿引用（见 host/chat.ts）。
+  // 不注入就拿不到 ctx.attachments，带图对话会以「附件服务不可用」失败。
+  'attachments',
+];
 
 /** 本包目录：宿主构建产物位于 lib/，其上一级即包根。 */
 const PACKAGE_ROOT = resolve(fileURLToPath(new URL('..', import.meta.url)));
@@ -355,13 +368,15 @@ export function apply(ctx: any): void {
   const lastWhisperAt = new Map<string, number>();
 
   // 对话记忆文件（唯一读写方 = 本进程；浏览器/桌面两端都只是客户端 → 同一实例天然共享同一份记忆）。
-  // 结构双层：{ <种类桶 assetRoot ?? petId>: { <实例 id>: { messages: ChatMemoryMessage[] } } }
+  // 结构双层：{ <种类桶 assetRoot ?? petId>: { <实例 id>: PetMemory } }
+  // PetMemory = { messages, summary? }；summary 是记忆整理（memory-compact.ts）产出的
+  // 「很久之前的大体意思」。旧文件没有该字段 → 读成 undefined，天然兼容。
   const memoryPath = join(userRoot, 'memory.json');
   // 对话写操作串行队列：read-modify-write 排队执行，防两端同时对话时交错写盘
   let chatQueue: Promise<void> = Promise.resolve();
 
   /** 读记忆文件：不存在 → 空；损坏 → 显式报错 + 备份原始文件（绝不静默丢数据）+ 重建空记忆 */
-  const readMemory = async (): Promise<Record<string, Record<string, { messages: ChatMemoryMessage[] }>>> => {
+  const readMemory = async (): Promise<Record<string, Record<string, PetMemory>>> => {
     let raw: string;
     try {
       raw = await readFile(memoryPath, 'utf8');
@@ -371,7 +386,7 @@ export function apply(ctx: any): void {
     try {
       const parsed = JSON.parse(raw) as Record<string, unknown>;
       if (!parsed || typeof parsed !== 'object') throw new Error('not an object');
-      return parsed as Record<string, Record<string, { messages: ChatMemoryMessage[] }>>;
+      return parsed as Record<string, Record<string, PetMemory>>;
     } catch (e) {
       console.error(
         `dsh-pet: 记忆文件损坏已备份（对话将从头开始）：${memoryPath}（${e instanceof Error ? e.message : String(e)}）`,
@@ -386,7 +401,7 @@ export function apply(ctx: any): void {
     }
   };
 
-  const writeMemory = async (mem: Record<string, Record<string, { messages: ChatMemoryMessage[] }>>): Promise<void> => {
+  const writeMemory = async (mem: Record<string, Record<string, PetMemory>>): Promise<void> => {
     await mkdir(userRoot, { recursive: true });
     await writeFile(memoryPath, JSON.stringify(mem, null, 2), 'utf8');
   };
@@ -426,13 +441,46 @@ export function apply(ctx: any): void {
     return Number.isFinite(v) && v >= 0 ? Math.floor(v) : 5;
   };
 
-  /** 生成/返回某宠物的一句碎碎念（周期 GET 与菜单手动触发共用的同一逻辑）：
+  /**
+   * 记忆整理参数（memory-compact 的 CompactOptions 子集，不含 now —— 由调用点取当前时刻）。
+   *
+   * 读法与 memoryRounds 同一套：条目配置优先、回落 main 条目、再回落内置默认。
+   * 配置层已保证是合法非负数（topFieldValid），这里只需处理「字段缺失」一种情况。
+   */
+  const compactOptions = (
+    conf: Record<string, unknown>,
+    mainConf: Record<string, unknown> | undefined,
+  ): { compactDays: number; keepRounds: number; maxChars: number } => {
+    const pick = (key: string, fallback: number): number => {
+      const raw = conf[key] ?? mainConf?.[key];
+      const n = Number(raw);
+      return Number.isFinite(n) && n >= 0 ? n : fallback;
+    };
+    return {
+      compactDays: pick('memoryCompactDays', COMPACT_DEFAULTS.compactDays),
+      keepRounds: pick('memoryCompactKeepRounds', COMPACT_DEFAULTS.keepRounds),
+      maxChars: pick('memoryCompactMaxChars', COMPACT_DEFAULTS.maxChars),
+    };
+  };
+
+  /** 整理周期（秒）：0 = 关闭整理。条目配置优先 → main 条目 → 内置默认 */
+  const compactPeriodSec = (cfg: Record<string, Record<string, unknown>>): number => {
+    const v = Number(cfg.main?.memoryCompactPeriodSec);
+    return Number.isFinite(v) && v >= 0 ? v : COMPACT_DEFAULTS.periodSec;
+  };
+
+  /** 生成/返回某宠物的一句碎碎念（周期调度与菜单手动触发共用的同一逻辑）：
    *  每只宠物独立生成（所属条目的人设）。生成成功就写进 S 的 pets.<id>.say——
    *  碎碎念 / 命令气泡 / 对话回复在前端本来就是**同一条展示链路**（同一个 triggerWhisper、
-   *  同一个气泡槽、同一批 events.whisper 动画），所以合并成同一个叶子；"周期内不重复"由
+   *  同一个气泡槽、同一批 events.whisper 动画），所以合并成同一个叶子；"间隔下限内不重复"由
    *  调度侧的 lastWhisperAt 保证，不再需要一份 whisperCache（多端共享也由 S 天然保证）。
-   *  配图（whisperImageEnabled 开启时）：从表情包池**随机抽 1 张**，把描述注入指令并随文本一起写。 */
-  const publishWhisper = async (petId: string): Promise<boolean> => {
+   *  配图（whisperImageEnabled 开启时）：从表情包池**随机抽 1 张**，把描述注入指令并随文本一起写。
+   *
+   *  @param tone 情境判断给出的调子（见 whisper-situation.ts）：celebrate 刚出结果、
+   *    comfort 出错后的关心、casual 日常。**手动触发（菜单/命令）不传** = casual，
+   *    与原行为逐字一致（用户主动点"说一句"时不需要桌宠自己判断场合）。
+   */
+  const publishWhisper = async (petId: string, tone: WhisperTone = 'casual'): Promise<boolean> => {
     const cfg = readAllConfig(configPaths);
     const found = findPetInstance(cfg, petId);
     const conf = found ? found.conf : (cfg.main ?? {});
@@ -441,7 +489,7 @@ export function apply(ctx: any): void {
     // 配图：全局开关关闭 / 池为空 / 池内图片全缺失 → 纯文本（不报错，退化为原行为）
     const meme = conf.whisperImageEnabled === true ? pickMeme(readMemePool(conf.memes, memeDirsFor(entry))) : undefined;
     // 模型：条目配置的 whisperModel 优先（留空 = 不指定）；生成侧失败会回落到当前对话的模型重试一次
-    const result = await generateWhisper(ctx, system, meme, configuredModel(conf, 'whisperModel'));
+    const result = await generateWhisper(ctx, system, meme, configuredModel(conf, 'whisperModel'), tone);
     if (!result.ok) {
       // 失败**不写 S**（与改造前一致：静默跳过 + console.warn，不伪造文案、不弹错误气泡）
       console.warn(
@@ -459,10 +507,12 @@ export function apply(ctx: any): void {
 
   /** 与某只宠物对话：截取最近记忆 → 生成回复 → 写入记忆 → 把回复写进 S 的 pets.<id>.say。
    *  供 POST /chat（动作端点）与 /chat 命令共用同一条路径（锁内读写，防两端交错写盘）。
-   *  配图（chatImageEnabled 开启时）：把表情包清单交给模型按语境选一张，命中池内才随回复写回。 */
+   *  配图（chatImageEnabled 开启时）：把表情包清单交给模型按语境选一张，命中池内才随回复写回。
+   *  截图（image 传入时）：随本轮提问一起发给多模态模型（存 attachment 拿引用，见 host/chat.ts）。 */
   const chatWithPet = async (
     petId: string,
     text: string,
+    image?: ChatImageInput,
   ): Promise<{ ok: true } | { ok: false; reason: 'provider-missing' | 'generate-error'; message?: string }> =>
     withMemoryLock(async () => {
       const cfg = readAllConfig(configPaths);
@@ -485,7 +535,16 @@ export function apply(ctx: any): void {
       // 不能写 slice(-rounds * 2)：-0 在 JS 里 === 0，slice(-0) 返回整个数组而不是空。
       const list = sliceMemoryRounds(entry.messages, rounds);
       // 模型：条目配置的 chatModel 优先（留空 = 不指定）；生成侧失败会回落到当前对话的模型重试一次
-      const generated = await generateChat(ctx, system, list, text, pool, configuredModel(conf, 'chatModel'));
+      const generated = await generateChat(
+        ctx,
+        system,
+        list,
+        text,
+        pool,
+        configuredModel(conf, 'chatModel'),
+        image,
+        entry.summary,
+      );
       if (!generated.ok) return generated;
       const now = Date.now();
       entry.messages.push({ role: 'user', content: text, ts: now });
@@ -502,6 +561,42 @@ export function apply(ctx: any): void {
     });
 
   /**
+   * 调模型产出记忆摘要（记忆整理的「压」这一步）。
+   *
+   * 走的是**碎碎念那条最省钱的路径**（provider 由 modelCandidates 决定、temperature 1、
+   * 关思考），而不是对话路径——摘要不需要人设口吻、不需要配图、不需要多模态。
+   *
+   * 【为什么复用 generateChat 而不是新写一个 llm 调用】generateChat 已经把「候选链回落、
+   * 关思考的兼容处理、超时、块拼装、无文本时的失败原因」这一整套踩过的坑都处理好了。
+   * 这里用一个专门的 system 提示词把它扭成「摘要器」：把待压对话当作一次 user 输入，
+   * 让模型回一段概述。复用比重写一份 llm 调用安全得多。
+   */
+  const generateCompactSummary = async (
+    prompt: string,
+    conf: Record<string, unknown>,
+    mainConf: Record<string, unknown> | undefined,
+  ): Promise<{ ok: true; summary: string } | { ok: false; reason: 'generate-error'; message?: string }> => {
+    const system =
+      '你是一个对话记忆整理器。请把用户提供的对话记录压缩成一段简洁的概述，' +
+      '保留：发生过的重要事情、用户的偏好与设定、未完成的话题。' +
+      '丢弃：寒暄、重复、语气词。' +
+      '如果提供了「已有的远期记忆摘要」，请把它与你看到的【新对话】合并成一份新的摘要，' +
+      '不要丢掉旧摘要里仍在起作用的信息。' +
+      '只输出摘要正文本身，不要任何前言、标题或解释。';
+    const result = await generateChat(
+      ctx,
+      system,
+      [], // 摘要不携带对话历史：它要总结的就是输入正文，带上历史反而会串味
+      prompt,
+      [], // 配图池留空：给摘要器附表情包清单毫无意义，纯浪费 token
+      configuredModel(conf, 'chatModel') ?? configuredModel(mainConf ?? {}, 'chatModel'),
+      undefined, // 不带截图
+    );
+    if (!result.ok) return { ok: false, reason: 'generate-error', message: result.message };
+    return { ok: true, summary: result.text };
+  };
+
+  /**
    * 当前生效宠物列表 = readAllConfig 成品拍平（main + 文件宠物全部条目；合并器已保证 id 唯一、
    * 字段填满），命令与桌面模式都从这里取。
    */
@@ -514,12 +609,25 @@ export function apply(ctx: any): void {
     return Number.isFinite(n) && n > 0 ? n : 1800;
   };
 
-  /** 碎碎念周期（秒）：该宠物**所属条目**的 eventsRefreshSec.whisper（合并器已填默认；非法兜底 300） */
-  const whisperPeriodSec = (cfg: Record<string, Record<string, unknown>>, petId: string): number => {
+  /**
+   * 碎碎念**最短间隔下限**（秒）：该宠物所属条目的 eventsRefreshSec.whisper（合并器已填默认）。
+   *
+   * 语义变更（原为"固定周期"）：现在它不再决定"何时冒泡"，只保证"不比这个更频繁"。
+   * 真正决定该不该说一句的是情境判断（host/whisper-situation.ts）——见下方调度器的注释。
+   * 键名与默认值都不变，因此**老配置无需改动**，只是行为从"到点必说"变成"最多这么频"。
+   */
+  const whisperMinIntervalSec = (cfg: Record<string, Record<string, unknown>>, petId: string): number => {
     const conf = (findPetInstance(cfg, petId) ?? { conf: cfg.main ?? {} }).conf;
     const ers = conf.eventsRefreshSec as Record<string, unknown> | undefined;
     const n = Number(ers?.whisper);
     return Number.isFinite(n) && n > 0 ? n : 300;
+  };
+
+  /** 碎碎念「最长静默」上限（秒）：0 / 非法 = 不设上限（该宠物所属条目；默认 0） */
+  const whisperMaxSilenceSec = (cfg: Record<string, Record<string, unknown>>, petId: string): number => {
+    const conf = (findPetInstance(cfg, petId) ?? { conf: cfg.main ?? {} }).conf;
+    const n = Number(conf.whisperMaxSilenceSec);
+    return Number.isFinite(n) && n > 0 ? n : WHISPER_DEFAULTS.maxSilenceSec;
   };
 
   /**
@@ -1178,7 +1286,26 @@ export function apply(ctx: any): void {
         if (method === 'POST') {
           const parsed = (JSON.parse(body ?? 'null') as Record<string, unknown> | null) ?? {};
           const text = typeof parsed.text === 'string' ? parsed.text.trim() : '';
-          if (!text) {
+          // 截图（可选）：渲染端从 helper 的 /screenshot 拿到 base64 JPEG 后原样带上。
+          // 只认 image/jpeg（截屏的唯一产物）；其它媒体类型一律不收——避免这条端点变成
+          // 任意图片上传口，插件的用途就是「看看屏幕」，不是通用图床。
+          const rawImage = parsed.image as { data?: unknown; mediaType?: unknown } | null | undefined;
+          let image: ChatImageInput | undefined;
+          if (rawImage && typeof rawImage === 'object') {
+            const data = typeof rawImage.data === 'string' ? rawImage.data : '';
+            if (data.length > 0) {
+              if (rawImage.mediaType !== 'image/jpeg') {
+                return {
+                  kind: 'json',
+                  status: 200,
+                  obj: { ok: false, reason: 'bad-request', message: '截图格式不受支持（仅 image/jpeg）' },
+                };
+              }
+              image = { data, mediaType: 'image/jpeg' };
+            }
+          }
+          // 有截图时正文允许为空（用户可能只想问"这是什么"）；纯文本仍按原样要求非空。
+          if (!text && !image) {
             return { kind: 'json', status: 200, obj: { ok: false, reason: 'bad-request', message: '消息为空' } };
           }
           if (text.length > 2000) {
@@ -1188,7 +1315,7 @@ export function apply(ctx: any): void {
               obj: { ok: false, reason: 'bad-request', message: '消息过长（限 2000 字）' },
             };
           }
-          const result = await chatWithPet(petId, text);
+          const result = await chatWithPet(petId, text, image);
           return { kind: 'json', status: 200, obj: result };
         }
         return { kind: 'json', status: 405, obj: { error: 'method not allowed' } };
@@ -1480,10 +1607,18 @@ export function apply(ctx: any): void {
     };
   }, 'dsh-pet: balance poll');
 
-  // 碎碎念周期：host 侧调度（前端不再有任何碎碎念定时器）。
-  // 一拍 = 读一次配置 + 给"到点"的宠物各生成一句；下一拍按**最短周期**排（多数部署只有一个
-  // 周期值，那它就是那个值）。用"读一次配置 + 逐宠物比对 lastWhisperAt"而不是每宠一个定时器：
-  // 宠物随配置增删、周期随条目改，固定拍天然跟上，不用维护一堆定时器的生命周期。
+  // 碎碎念调度：host 侧唯一调度点（前端不再有任何碎碎念定时器）。
+  //
+  // **改造要点（原为纯定时器）**：过去"到点必说一句"，跟钟表走、不看场合——正忙时插科打诨、
+  // 深夜照样冒泡、刚出结果时反而沉默。现在改成**情境驱动**：
+  //   - 每拍不是"谁到点了"，而是"谁【此刻该说话】"（decideWhisper，纯函数可单测）
+  //   - eventsRefreshSec.whisper 从"固定周期"降级为"最短间隔下限"（硬闸，任何情境都不能突破）
+  //   - 忙碌（thinking/working/waiting/error）静默；刚出结果（success/result）说一句；
+  //     深夜要求 4 倍间隔；可选 whisperMaxSilenceSec 保证不会永远沉默
+  // 判断完全本地（不调模型）——否则"判断该不该说"比"生成那句话"还贵。
+  //
+  // 拍长仍按**最短间隔**排（不必逐秒轮询）：情境判断依赖的状态变化（工作状态/时段）粒度都在
+  // 分钟级以上，按最小间隔醒来足够灵敏，且不浪费常驻定时器。
   ctx.effect(() => {
     let disposed = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
@@ -1496,16 +1631,35 @@ export function apply(ctx: any): void {
       try {
         const cfg = readAllConfig(configPaths);
         const now = Date.now();
+        // 情境信号只采一次（同一拍里所有宠物共享同一时刻的时钟/工作状态）
+        const date = new Date(now);
+        const slot = timeSlotOf(date.getHours());
+        const weekend = dayKindOf(date.getDay()) === '周末';
+        // 工作状态：null = 尚无会话活动（空闲）。取全局展示快照——
+        // 碎碎念是桌宠级行为，用"当前最忙的那个会话"作整体情境最合理
+        // （某个会话在跑就不该在另一个会话的桌宠上插话）。
+        const workState = workStatus.snapshot().state;
         let min = Infinity;
         for (const pet of flattenPetList(cfg)) {
           const petId = String(pet.id ?? '');
           if (!petId || pet.whisperEnabled !== true) continue;
-          const sec = whisperPeriodSec(cfg, petId);
-          min = Math.min(min, sec);
-          if (now - (lastWhisperAt.get(petId) ?? 0) < sec * 1000) continue;
+          const minIntervalSec = whisperMinIntervalSec(cfg, petId);
+          min = Math.min(min, minIntervalSec);
+          const sinceLastMs = now - (lastWhisperAt.get(petId) ?? 0);
+          const decision = decideWhisper({
+            workState,
+            sinceLastMs,
+            minIntervalSec,
+            timeSlot: slot,
+            isWeekend: weekend,
+            maxSilenceSec: whisperMaxSilenceSec(cfg, petId),
+          });
+          if (!decision.speak) continue;
+          // 记时间戳**在这里**（生成前）：语义是"这次尝试过了"。
+          // 失败不重试是刻意的——见下方 publishWhisper 失败分支的注释。
           lastWhisperAt.set(petId, now);
           // 不 await：生成要几秒，别把调度拍拖住（每只宠物独立生成，互不阻塞）
-          void publishWhisper(petId).catch(() => {});
+          void publishWhisper(petId, decision.tone).catch(() => {});
         }
         if (Number.isFinite(min)) next = min;
       } catch {
@@ -1514,12 +1668,128 @@ export function apply(ctx: any): void {
       }
       arm(next);
     }
-    void tick(); // 启动即生成一次（与改造前客户端首拉就生成一致）
+    void tick(); // 启动即判断一次（与改造前的首拉一致）
     return () => {
       disposed = true;
       if (timer !== null) clearTimeout(timer);
     };
   }, 'dsh-pet: whisper poll');
+
+  /**
+   * 记忆整理：把「很久之前」的消息压成一段大体意思，重建记忆文件。
+   *
+   * 【为什么不就地删】删消息是「边读边改」，中途异常/断电可能留下半截文件，而 readMemory
+   * 遇到损坏是「备份 + 从头开始」——整份记忆一次报废。这里改成**算出一份新记忆 → 整份覆盖**：
+   * 要么是旧内容、要么是新内容，没有中间态。
+   *
+   * 【为什么在 withMemoryLock 里】对话是 read-modify-write：读整份 → push → 写整份。
+   * 整理若在锁外跑，它写的「重建结果」会把并发的对话消息覆盖掉（丢消息）。封进同一把锁后，
+   * 两者严格串行，谁都不会覆盖谁。
+   *
+   * 【为什么失败要重排】余额/碎碎念定时器读配置抛错就「不再重排」（安装损坏、重试无意义）。
+   * 整理不同：它做的是**会调模型**的活，一次超时/限流很常见，一次失败就永久停摆是说不过去的。
+   * 所以这里读配置失败也照常重排（周期本身够长，重试成本可忽略）。
+   */
+  const compactAllMemories = async (): Promise<void> =>
+    withMemoryLock(async () => {
+      const cfg = readAllConfig(configPaths);
+      const mainConf = cfg.main as Record<string, unknown> | undefined;
+      const mem = await readMemory();
+      const now = Date.now();
+      let touched = 0;
+      let compactedMessages = 0;
+      for (const [bucketKey, bucket] of Object.entries(mem)) {
+        for (const [id, entry] of Object.entries(bucket)) {
+          // 参数按实例所属条目取（findPetInstance 认 id；认不出 → 回落 main 条目，
+          // 与 memoryRounds/compactPeriodSec 同一套回落规则）
+          const found = findPetInstance(cfg, id);
+          const conf = (found?.conf ?? mainConf ?? {}) as Record<string, unknown>;
+          const opts = { ...compactOptions(conf, mainConf), now };
+          const before = (entry.messages ?? []).length;
+          let result;
+          try {
+            result = await compactPetMemory(entry as PetMemory, opts, (prompt) =>
+              generateCompactSummary(prompt, conf, mainConf),
+            );
+          } catch (e) {
+            // 单个实例失败不影响其它实例（各实例独立整理）
+            console.warn(
+              `dsh-pet: 记忆整理失败（${bucketKey}/${id}）：${e instanceof Error ? e.message : String(e)}`,
+            );
+            continue;
+          }
+          if (!result.changed) continue;
+          // 就地替换该实例的记忆（mem 是刚读出来的私有快照，直接改安全）
+          bucket[id] = result.memory;
+          touched++;
+          compactedMessages += result.compactedCount;
+          console.log(
+            `dsh-pet: 记忆整理完成（${bucketKey}/${id}）：${before} 条 → ${result.memory.messages.length} 条 + 摘要 ${result.memory.summary?.length ?? 0} 字（压入 ${result.compactedCount} 条）`,
+          );
+        }
+      }
+      if (touched === 0) return; // 没有任何实例需要整理 → 不写盘（避免无谓 IO 与 mtime 变动）
+      // 重建前先备份：摘要是**有损**的，模型写跑偏时用户还能从备份找回原文。
+      // 复用 readMemory 的备份命名风格（.bak-<时间戳>），且失败不阻断整理。
+      try {
+        const raw = await readFile(memoryPath, 'utf8');
+        await writeFile(`${memoryPath}.bak-${Date.now()}`, raw, 'utf8');
+      } catch {
+        /* 备份失败仅告警，不阻断 */
+      }
+      await writeMemory(mem);
+      console.log(`dsh-pet: 记忆整理已重建记忆文件（${touched} 个实例，压入 ${compactedMessages} 条消息）`);
+    });
+
+  /**
+   * 记忆整理的定时调度。
+   *
+   * 与碎碎念/余额定时器同一套骨架（effect + arm 自排 + disposed 守卫 + 卸载清句柄），
+   * 三点不同（都是刻意的）：
+   *   - **启动即整理**：用户装上新版插件后不必等一个周期就能看到效果；且整理过一轮之后
+   *     no-op 成本极低（只读一次文件、切分发现无可压即返回，不调模型不写盘）。
+   *   - **周期从主条目读**（不取所有宠物的最小值）：整理是全局动作，一次跑所有实例，
+   *     没必要像碎碎念那样按宠物各自排期。
+   *   - **失败照常重排**（见 compactAllMemories 注释）：它要调模型，一次超时不等于应该永久停摆。
+   */
+  ctx.effect(() => {
+    let disposed = false;
+    let timer: ReturnType<typeof setTimeout> | null = null;
+    const arm = (sec: number) => {
+      if (disposed) return;
+      timer = setTimeout(tick, Math.max(1, sec) * 1000);
+    };
+    const tick = () => {
+      if (disposed) return;
+      void compactAllMemories()
+        .catch((e) => {
+          console.warn(`dsh-pet: 记忆整理调度失败：${e instanceof Error ? e.message : String(e)}`);
+        })
+        .finally(() => {
+          // 下一拍的周期从配置重读：用户改周期后无需重启插件即可生效。
+          // 配置读不出来（安装损坏）→ 用内置默认继续排，不因一次读失败就停摆。
+          let sec = COMPACT_DEFAULTS.periodSec;
+          try {
+            const cfg = readAllConfig(configPaths);
+            const v = compactPeriodSec(cfg);
+            if (v <= 0) {
+              // 0 = 用户显式关闭整理：不再重排（卸载时由 effect 的清理函数兜底）
+              console.log('dsh-pet: 记忆整理已关闭（memoryCompactPeriodSec = 0）');
+              return;
+            }
+            sec = v;
+          } catch {
+            /* 读配置失败 → 用默认周期继续 */
+          }
+          arm(sec);
+        });
+    };
+    arm(compactPeriodSec(readAllConfig(configPaths)));
+    return () => {
+      disposed = true;
+      if (timer !== null) clearTimeout(timer);
+    };
+  }, 'dsh-pet: memory compact');
 
   // /pet 斜杠命令：选择「当前桌宠」（/chat 对话的目标）。浏览器端另有 commandUi 装饰的选择框
   // （裸输 /pet 回车或菜单点选时弹出，选中后提交 /pet <id> 走同一 handler）；手输参数认 id 或名字

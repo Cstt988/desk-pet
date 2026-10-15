@@ -45,7 +45,7 @@ try {
   );
   process.exit(3);
 }
-const { app, BrowserWindow, ipcMain, screen, shell, protocol } = electronApi;
+const { app, BrowserWindow, desktopCapturer, ipcMain, screen, shell, protocol } = electronApi;
 const path = require('node:path');
 const { execFileSync } = require('node:child_process');
 const { readFileSync, writeFileSync } = require('node:fs');
@@ -536,6 +536,75 @@ function createPetWindows() {
   }
 }
 
+// ---------- 截屏（宠物「看看屏幕」） ----------
+//
+// 【为什么放在本进程而不是宿主】只有 Electron 主进程能拿到 desktopCapturer；宿主（Node）没有任何
+// 取屏手段。故截屏是一个**纯进程内**动作：渲染端请求 → protocol.handle 拦到 /screenshot →
+// 这里抓屏 → 直接回 PNG，全程不过 bridge 管道。好处是宿主侧不需要新增能力，也不需要为二进制
+// 开一条新通道（素材那条「宿主回绝对路径、本进程读盘」的路子只适用于磁盘上已存在的文件）。
+//
+// 【为什么不用 capturePage】BrowserWindow.capturePage 只抓窗口自身内容，而宠物窗口是透明小窗
+// （只有一坨宠物），抓不到用户真正想给模型看的东西（桌面/别的应用）。用户语义是「看我的屏幕」，
+// 故用 desktopCapturer 抓指定屏幕的整屏缩略图。
+//
+// 【用 thumbnailSize 而不是抓完再缩】desktopCapturer 支持在**采集阶段**按 thumbnailSize 出图，
+// 省掉一次内存解码/缩放。取屏幕逻辑尺寸（DIP）作为目标，再交给 electron 按 scaleFactor 放大，
+// 得到的是物理像素整屏。
+//
+// 【为什么回 JPEG 而不是 PNG】整屏 PNG 动辄数 MB，而 dsh-llm 对请求内图片有硬预算
+// （requestImageMaxBytes = 1 MiB，见 workbuddy 的 REQUEST_IMAGE_BUDGETS）；超预算的图会在请求
+// 组装期就被判失败。JPEG（quality 80）把 1920×1080 压到数百 KB，稳在预算内，视觉信息也够用。
+const SCREENSHOT_JPEG_QUALITY = 80;
+
+/**
+ * 抓一张屏幕图。
+ * @param {string|undefined} displayId - 目标屏幕的 desktopCapturer source id（缺省 = 主屏）。
+ *   传 'primary' / 空 = 主屏。取不到指定屏幕时回落主屏（宁可给用户一张主屏图，也不要报错空手而归）。
+ * @returns {Promise<{data: string, width: number, height: number, displayId: string, scaleFactor: number}|null>}
+ *   成功返回 base64（不含 data: 前缀）与像素尺寸；无可用屏幕时返回 null。
+ */
+async function captureScreenshot(displayId) {
+  // 目标尺寸取主屏逻辑尺寸：thumbnailSize 是物理像素，故再乘 scaleFactor（见上面注释）。
+  const primary = screen.getPrimaryDisplay();
+  const wantPrimary = !displayId || displayId === 'primary';
+  const target = primary;
+  const scale = target.scaleFactor || 1;
+  const width = Math.max(1, Math.round(target.size.width * scale));
+  const height = Math.max(1, Math.round(target.size.height * scale));
+
+  let sources;
+  try {
+    sources = await desktopCapturer.getSources({
+      types: ['screen'],
+      thumbnailSize: { width, height },
+    });
+  } catch (e) {
+    console.error('[dsh-pet-desktop-helper] desktopCapturer failed:', String(e && e.message ? e.message : e));
+    return null;
+  }
+  if (!sources || sources.length === 0) return null;
+
+  // 选源：优先 id 精确匹配；否则取主屏（display_id 与 Display.id 口径不保证一致，
+  // 精确匹配只作最优解，不匹配时按主屏兜底而不是报错——用户要的是「看一眼屏幕」，不是选屏器）。
+  let source = sources.find((s) => !wantPrimary && s.id === displayId);
+  if (!source) {
+    const primarySourceId = String(primary.id);
+    source = sources.find((s) => s.id.includes(':' + primarySourceId + ':')) ?? sources[0];
+  }
+  const image = source.thumbnail;
+  if (!image || image.isEmpty()) return null;
+  const jpeg = image.toJPEG(SCREENSHOT_JPEG_QUALITY);
+  if (!jpeg || jpeg.length === 0) return null;
+  const size = image.getSize();
+  return {
+    data: jpeg.toString('base64'),
+    width: size.width,
+    height: size.height,
+    displayId: source.id,
+    scaleFactor: scale,
+  };
+}
+
 // ---------- bridge 协议（渲染端 custom scheme → 本进程 → 宿主 stdout JSON 行 + 本地回调） ----------
 // 渲染端的每个 fetch 都落到 dsh-pet-bridge://，protocol.handle 把请求以一行 JSON 写 stdout 转发宿主。
 // 宿主应答**不走近 0 号管道**：Electron 主进程在 Windows 上收不到 piped stdin（electron#4218），
@@ -614,6 +683,18 @@ function startBridgeCallback() {
 async function handleBridgeRequest(request) {
   const url = new URL(request.url); // dsh-pet-bridge://dsh-pet/dsh-pet-7340/...
   const method = request.method || 'GET';
+
+  // 截屏是**本进程独占**的能力（宿主拿不到 desktopCapturer），故在转发宿主之前就地处理：
+  // 这条路径不进 bridge 管道，宿主完全无感。路径与宿主路由同前缀，渲染端只换路径名即可。
+  if (url.pathname.endsWith('/screenshot')) {
+    const shot = await captureScreenshot(url.searchParams.get('display') ?? undefined);
+    const headers = { 'access-control-allow-origin': '*', 'content-type': 'application/json' };
+    if (!shot) {
+      return new Response(JSON.stringify({ ok: false, reason: 'capture-failed' }), { status: 200, headers });
+    }
+    return new Response(JSON.stringify({ ok: true, ...shot }), { status: 200, headers });
+  }
+
   let body;
   if (method === 'POST' || method === 'PUT') {
     body = await request.text();
